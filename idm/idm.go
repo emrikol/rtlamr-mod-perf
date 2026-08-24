@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/bemasher/rtlamr/crc"
 	"github.com/bemasher/rtlamr/protocol"
@@ -35,9 +34,12 @@ type Parser struct {
 	crc.CRC
 	cfg  protocol.PacketConfig
 	data protocol.Data
+	seen map[[92]byte]struct{}
 }
 
 func (p Parser) SetDecoder(*protocol.Decoder) {}
+
+func (p Parser) Power16Compatible() bool { return true }
 
 func (p Parser) Cfg() protocol.PacketConfig {
 	return p.cfg
@@ -56,22 +58,31 @@ func NewParser(chipLength int) (p protocol.Parser) {
 			Preamble:        "01010101010101010001011010100011",
 		},
 		data: protocol.Data{Bytes: make([]byte, 92)},
+		seen: make(map[[92]byte]struct{}),
 	}
 }
 
-func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sync.WaitGroup) {
-	seen := make(map[string]bool)
+func (p Parser) PacketBytesOnly() bool { return true }
+
+func (p Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
+	if p.seen == nil {
+		p.seen = make(map[[92]byte]struct{})
+	} else {
+		for packet := range p.seen {
+			delete(p.seen, packet)
+		}
+	}
 
 	for _, pkt := range pkts {
 		p.data.Idx = pkt.Idx
-		p.data.Bits = pkt.Bits[0:p.cfg.PacketSymbols]
 		copy(p.data.Bytes, pkt.Bytes)
 
-		s := string(p.data.Bytes)
-		if seen[s] {
+		var packet [92]byte
+		copy(packet[:], p.data.Bytes)
+		if _, duplicate := p.seen[packet]; duplicate {
 			continue
 		}
-		seen[s] = true
+		p.seen[packet] = struct{}{}
 
 		// If the packet checksum fails, bail.
 		if residue := p.Checksum(p.data.Bytes[4:92]); residue != p.Residue {
@@ -79,10 +90,10 @@ func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *syn
 		}
 
 		// If the serial checksum fails, bail.
-		buf := make([]byte, 6)
-		copy(buf, p.data.Bytes[9:13])
-		copy(buf[4:], p.data.Bytes[88:90])
-		if residue := p.Checksum(buf); residue != p.Residue {
+		var serial [6]byte
+		copy(serial[:], p.data.Bytes[9:13])
+		copy(serial[4:], p.data.Bytes[88:90])
+		if residue := p.Checksum(serial[:]); residue != p.Residue {
 			continue
 		}
 
@@ -91,10 +102,10 @@ func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *syn
 			continue
 		}
 
-		msgCh <- idm
+		messages = append(messages, idm)
 	}
 
-	wg.Done()
+	return messages
 }
 
 // Standard Consumption Message
@@ -128,22 +139,47 @@ func NewIDM(data protocol.Data) (idm IDM) {
 	idm.ERTSerialNumber = binary.BigEndian.Uint32(data.Bytes[9:13])
 	idm.ConsumptionIntervalCount = data.Bytes[13]
 	idm.ModuleProgrammingState = data.Bytes[14]
-	idm.TamperCounters = data.Bytes[15:21]
+	idm.TamperCounters = append([]byte(nil), data.Bytes[15:21]...)
 	idm.AsynchronousCounters = binary.BigEndian.Uint16(data.Bytes[21:23])
-	idm.PowerOutageFlags = data.Bytes[23:29]
+	idm.PowerOutageFlags = append([]byte(nil), data.Bytes[23:29]...)
 	idm.LastConsumptionCount = binary.BigEndian.Uint32(data.Bytes[29:33])
 
-	offset := 264
-	for idx := range idm.DifferentialConsumptionIntervals {
-		interval, _ := strconv.ParseUint(data.Bits[offset:offset+9], 2, 9)
-		idm.DifferentialConsumptionIntervals[idx] = uint16(interval)
-		offset += 9
+	if data.Bits == "" {
+		idm.DifferentialConsumptionIntervals = decodeIntervals(data.Bytes[33:86])
+	} else {
+		offset := 264
+		for idx := range idm.DifferentialConsumptionIntervals {
+			interval, _ := strconv.ParseUint(data.Bits[offset:offset+9], 2, 9)
+			idm.DifferentialConsumptionIntervals[idx] = uint16(interval)
+			offset += 9
+		}
 	}
 
 	idm.TransmitTimeOffset = binary.BigEndian.Uint16(data.Bytes[86:88])
 	idm.SerialNumberCRC = binary.BigEndian.Uint16(data.Bytes[88:90])
 	idm.PacketCRC = binary.BigEndian.Uint16(data.Bytes[90:92])
 
+	return
+}
+
+func decodeIntervals(data []byte) (intervals Interval) {
+	var bits uint32
+	var available uint
+	byteIndex := 0
+	for idx := range intervals {
+		for available < 9 {
+			bits = bits<<8 | uint32(data[byteIndex])
+			byteIndex++
+			available += 8
+		}
+		available -= 9
+		intervals[idx] = uint16(bits>>available) & 0x01ff
+		if available == 0 {
+			bits = 0
+		} else {
+			bits &= (uint32(1) << available) - 1
+		}
+	}
 	return
 }
 
@@ -155,6 +191,9 @@ func (interval Interval) Record() (r []string) {
 	}
 	return
 }
+
+var _ protocol.Power16Compatible = (*Parser)(nil)
+var _ protocol.PacketBytesOnly = (*Parser)(nil)
 
 func (idm IDM) MsgType() string {
 	return "IDM"

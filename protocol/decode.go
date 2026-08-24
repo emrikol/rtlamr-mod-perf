@@ -17,10 +17,16 @@
 package protocol
 
 import (
+	"encoding/binary"
 	"log"
 	"math"
+	"math/bits"
 	"strings"
-	"sync"
+)
+
+const (
+	fixedIDMPreambleASCII  = "01010101010101010001011010100011"
+	fixedR900PreambleASCII = "00000000000000001110010101100100"
 )
 
 // PacketConfig specifies packet-specific radio configuration.
@@ -58,34 +64,67 @@ func (d Decoder) Log() {
 
 	log.Println("Protocols:", strings.Join(d.protocols, ","))
 	log.Println("Preambles:", strings.Join(preambles, ","))
+	status := d.DispatchStatus()
+	log.Println("DecoderImplementation:", status.Implementation)
+	log.Println("Power16Active:", status.Power16Active)
+	if status.FallbackReason != "" {
+		log.Println("Power16FallbackReason:", status.FallbackReason)
+	}
 }
 
 // Decoder contains buffers and radio configuration.
 type Decoder struct {
 	Cfg PacketConfig
-	wg  *sync.WaitGroup
 
 	Signal    []float64
 	Quantized []byte
 
-	csum  []float64
-	demod Demodulator
+	demod                Demodulator
+	filterOutput         []byte
+	filterScratch        []byte
+	quantizedBacking     []byte
+	quantizedStart       int
+	signalHistoryOverlap int
+	signalBacking        []float64
+	signalBlock          int
+	signalBlockCount     int
+	signalBlockStride    int
+	signalBlockShift     int
+	signalBlockMask      int
+	signalGap            int
 
-	preambleStrs map[string]bool
-	preambles    map[string][]Parser
-	protocols    []string
+	power16Policy            power16Policy
+	power16Probe             power16PlatformProbe
+	power16                  *power16State
+	power16ParserCount       int
+	power16ParsersCompatible bool
+	power16Consumers         []Power16HistoryConsumer
+	dispatchStatus           DecoderDispatchStatus
+
+	preambleStrs                              map[string]bool
+	preambles                                 map[string][]Parser
+	protocols                                 []string
+	fixedIDMParsers, fixedR900Parsers         []Parser
+	fixedIDMPreambleKey, fixedR900PreambleKey string
 
 	pkt []byte
 
 	packed       []byte
+	alignedMasks []byte
 	sIdxA, sIdxB []int
 }
 
 func NewDecoder() Decoder {
+	return newDecoder(power16PolicyAutomatic, probePower16Platform)
+}
+
+func newDecoder(policy power16Policy, probe power16PlatformProbe) Decoder {
 	return Decoder{
-		wg:           new(sync.WaitGroup),
-		preambles:    make(map[string][]Parser),
-		preambleStrs: make(map[string]bool),
+		preambles:                make(map[string][]Parser),
+		preambleStrs:             make(map[string]bool),
+		power16Policy:            policy,
+		power16Probe:             probe,
+		power16ParsersCompatible: true,
 	}
 }
 
@@ -100,9 +139,31 @@ func max(a, b int) int {
 func (d *Decoder) RegisterProtocol(p Parser) {
 	// Protocols such as R900 require the use of internal decoder data for further processing.
 	p.SetDecoder(d)
+	d.power16ParserCount++
+	compatible, ok := p.(Power16Compatible)
+	if !ok || !compatible.Power16Compatible() {
+		d.power16ParsersCompatible = false
+	}
+	consumer, consumesPower16 := p.(Power16HistoryConsumer)
+	if consumesPower16 {
+		d.power16Consumers = append(d.power16Consumers, consumer)
+	}
+	if historyParser, ok := p.(interface{ SignalHistoryOverlap() int }); ok {
+		overlap := historyParser.SignalHistoryOverlap()
+		if overlap > d.signalHistoryOverlap {
+			d.signalHistoryOverlap = overlap
+		}
+		if overlap > 0 && !consumesPower16 {
+			d.power16ParsersCompatible = false
+		}
+	}
 
-	// Take the largest value for each protocol. Some values are simply overridden
-	d.Cfg.CenterFreq = p.Cfg().CenterFreq
+	// Take the largest value for each protocol. Choosing the highest registered
+	// center frequency makes mixed-protocol defaults independent of registration
+	// order. Callers may still explicitly override the resulting center.
+	if center := p.Cfg().CenterFreq; center > d.Cfg.CenterFreq {
+		d.Cfg.CenterFreq = center
+	}
 	d.Cfg.DataRate = max(d.Cfg.DataRate, p.Cfg().DataRate)
 	d.Cfg.ChipLength = max(d.Cfg.ChipLength, p.Cfg().ChipLength)
 	d.Cfg.PreambleSymbols = max(d.Cfg.PreambleSymbols, p.Cfg().PreambleSymbols)
@@ -120,8 +181,19 @@ func (d *Decoder) RegisterProtocol(p Parser) {
 	// Keep track of registered preambles for logging back to the user.
 	d.preambleStrs[p.Cfg().Preamble] = true
 
-	// Associate the parser with the appropriate preamble.
-	d.preambles[string(preambleBytes)] = append(d.preambles[string(preambleBytes)], p)
+	// Associate the parser with the appropriate preamble. Cache the two fixed
+	// 32-symbol families so the A72 can search them together without scanning
+	// or classifying disabled protocols in the hot path.
+	preambleKey := string(preambleBytes)
+	d.preambles[preambleKey] = append(d.preambles[preambleKey], p)
+	switch p.Cfg().Preamble {
+	case fixedIDMPreambleASCII:
+		d.fixedIDMParsers = d.preambles[preambleKey]
+		d.fixedIDMPreambleKey = preambleKey
+	case fixedR900PreambleASCII:
+		d.fixedR900Parsers = d.preambles[preambleKey]
+		d.fixedR900PreambleKey = preambleKey
+	}
 
 	// Add the protocol to the list for logging back to the user.
 	d.protocols = append(d.protocols, p.Cfg().Protocol)
@@ -129,6 +201,8 @@ func (d *Decoder) RegisterProtocol(p Parser) {
 
 // Calculate lengths and allocate internal buffers.
 func (d *Decoder) Allocate() {
+	d.detachPower16Consumers()
+	d.power16 = nil
 	d.Cfg.SymbolLength = d.Cfg.ChipLength << 1
 	d.Cfg.SampleRate = d.Cfg.DataRate * d.Cfg.ChipLength
 
@@ -140,14 +214,28 @@ func (d *Decoder) Allocate() {
 
 	d.Cfg.BufferLength = d.Cfg.PacketLength + d.Cfg.BlockSize
 
-	// Allocate necessary buffers.
-	d.Signal = make([]float64, d.Cfg.BlockSize+d.Cfg.SymbolLength)
-	d.Quantized = make([]byte, d.Cfg.BufferLength)
-
-	d.csum = make([]float64, len(d.Signal)+1)
-
-	// Calculate magnitude lookup table specified by -fastmag flag.
-	d.demod = NewMagLUT()
+	// Allocate one representation at an allocation-time boundary. Automatic
+	// Power16 selection still requires every parser, geometry, CPU, feature,
+	// self-test, and kill-switch gate to pass.
+	if platform, ok := d.selectPower16Platform(); ok {
+		d.allocatePower16(platform)
+		d.attachPower16Consumers()
+	} else {
+		d.allocateFloatSignal()
+	}
+	d.quantizedBacking = nil
+	if d.power16 != nil && d.power16.runPacked != nil {
+		d.quantizedBacking = make([]byte, d.Cfg.BufferLength+d.Cfg.BlockSize)
+		// Do not expose the direct-write extension through Quantized's capacity.
+		d.Quantized = d.quantizedBacking[:d.Cfg.BufferLength:d.Cfg.BufferLength]
+		// The extension is also the fallback scratch if a caller replaces the
+		// exported Quantized slice. Direct and fallback writes are exclusive.
+		d.filterScratch = d.quantizedBacking[d.Cfg.BufferLength:]
+	} else {
+		d.Quantized = make([]byte, d.Cfg.BufferLength)
+		d.filterScratch = make([]byte, d.Cfg.BlockSize)
+	}
+	d.filterOutput = d.filterScratch
 
 	// Signal up to the final stage is 1-bit per byte. Allocate a buffer to
 	// store packed version 8-bits per byte.
@@ -156,46 +244,184 @@ func (d *Decoder) Allocate() {
 	d.sIdxA = make([]int, 0, d.Cfg.BlockSize)
 	d.sIdxB = make([]int, 0, d.Cfg.BlockSize)
 
-	d.packed = make([]byte, (d.Cfg.BlockSize+d.Cfg.PreambleLength+7)>>3)
+	if d.power16 != nil && d.power16.runPacked != nil {
+		d.packed = d.power16.packedSearchWindow()
+	} else {
+		d.packed = make([]byte, (d.Cfg.BlockSize+d.Cfg.PreambleLength+7)>>3)
+	}
 
 	return
 }
 
-// Decode accepts a sample block and returns a channel of messages.
-func (d Decoder) Decode(input []byte) chan Message {
-	// Shift buffers to append new block.
-	copy(d.Signal, d.Signal[d.Cfg.BlockSize:])
-	copy(d.Quantized, d.Quantized[d.Cfg.BlockSize:])
+// Decode accepts a sample block and returns the messages it contains.
+func (d *Decoder) Decode(input []byte) (messages []Message) {
+	if d.power16 != nil {
+		if d.appendPower16AndFilter(input) {
+			return d.decodeQuantized()
+		}
+	} else {
+		d.appendSignal(input)
 
-	// Compute the magnitude of the new block.
-	d.demod.Execute(input, d.Signal[d.Cfg.SymbolLength:])
+		// Perform matched filter on new block.
+		d.Filter(d.Signal, d.filterOutput)
+	}
+	return d.decodeFiltered(d.filterOutput)
+}
 
-	// Perform matched filter on new block.
-	d.Filter(d.Signal, d.Quantized[d.Cfg.PacketLength:])
+// decodeFiltered advances the decision history and services every registered
+// parser. Keeping this representation-independent tail in one place preserves
+// parser object identity and ordering when another exact producer is wired in.
+func (d *Decoder) decodeFiltered(block []byte) (messages []Message) {
+	d.appendQuantized(block)
+	if d.power16 == nil || d.power16.runPacked == nil {
+		packQuantizedRing(d.packed, d.Quantized, d.quantizedStart)
+	}
+	return d.decodeQuantized()
+}
 
-	msgCh := make(chan Message)
-
-	// For each preamble.
-	for preamble, parsers := range d.preambles {
-		// Get a list of packets with valid preambles.
-		pkts := d.Slice(d.Search([]byte(preamble)))
-
-		// Increment the wait group for all the parsers we will run on these packets.
-		d.wg.Add(len(parsers))
-
-		// For each parser, run it on the given packets.
-		for _, p := range parsers {
-			go p.Parse(pkts, msgCh, d.wg)
+// decodeQuantized services the common search/parser tail after the decision
+// history has already advanced. The packed Power16 producer uses this entry
+// point to avoid copying its contiguous output into the same ring afterward.
+func (d *Decoder) decodeQuantized() (messages []Message) {
+	dualFixed := false
+	if len(d.fixedIDMParsers) != 0 && len(d.fixedR900Parsers) != 0 {
+		d.sIdxA, d.sIdxB, dualFixed = searchAlignedCandidates32DualFixedPlatform(d.packed, d.Cfg.SymbolLength>>3, d.sIdxA[:0], d.sIdxB[:0])
+		if dualFixed {
+			messages = d.parseCandidates(d.sIdxA, d.fixedIDMParsers, messages)
+			messages = d.parseCandidates(d.sIdxB, d.fixedR900Parsers, messages)
+			if len(d.preambles) == 2 {
+				return messages
+			}
 		}
 	}
 
-	// Close the message channel when all of the parsers have finished.
-	go func() {
-		d.wg.Wait()
-		close(msgCh)
-	}()
+	for preamble, parsers := range d.preambles {
+		if dualFixed && (preamble == d.fixedIDMPreambleKey || preamble == d.fixedR900PreambleKey) {
+			continue
+		}
+		messages = d.parseCandidates(d.searchPacked([]byte(preamble)), parsers, messages)
+	}
 
-	return msgCh
+	return messages
+}
+
+// parseCandidates keeps the existing packet representation for ordinary and
+// external parsers, while allowing index-only parsers to skip packet slicing
+// and byte-only parsers to skip bit-string construction. Parser order remains
+// unchanged; a shared packet projection is materialized lazily at most once
+// per preamble.
+func (d Decoder) parseCandidates(indices []int, parsers []Parser, messages []Message) []Message {
+	var packets []Data
+	materialized := false
+	includeBits := false
+	for _, parser := range parsers {
+		if _, ok := parser.(CandidateIndexParser); ok {
+			continue
+		}
+		bytesOnly, ok := parser.(PacketBytesOnly)
+		if !ok || !bytesOnly.PacketBytesOnly() {
+			includeBits = true
+			break
+		}
+	}
+	for _, parser := range parsers {
+		if indexParser, ok := parser.(CandidateIndexParser); ok {
+			messages = indexParser.ParseCandidateIndices(indices, messages)
+			continue
+		}
+		if !materialized {
+			packets = d.slice(indices, includeBits)
+			materialized = true
+		}
+		messages = parser.Parse(packets, messages)
+	}
+	return messages
+}
+
+// appendSignal computes a magnitude block and retains the full history only
+// when a registered parser needs it. Signal remains the same contiguous short
+// filter window in either mode.
+func (d *Decoder) appendSignal(input []byte) {
+	if len(d.signalBacking) == 0 {
+		copy(d.Signal, d.Signal[d.Cfg.BlockSize:])
+		d.demod.Execute(input, d.Signal[d.Cfg.SymbolLength:])
+		return
+	}
+
+	previousStart := d.signalBlock * d.signalBlockStride
+	d.signalBlock++
+	if d.signalBlock == d.signalBlockCount {
+		d.signalBlock = 0
+	}
+	currentStart := d.signalBlock * d.signalBlockStride
+	overlap := d.signalHistoryOverlap
+	copy(d.signalBacking[currentStart:currentStart+overlap], d.signalBacking[previousStart+d.Cfg.BlockSize:previousStart+d.Cfg.BlockSize+overlap])
+	d.demod.Execute(input, d.signalBacking[currentStart+overlap:currentStart+d.signalBlockStride])
+	d.Signal = d.signalBacking[currentStart+overlap-d.Cfg.SymbolLength : currentStart+d.signalBlockStride]
+}
+
+// SignalAt returns a magnitude sample by logical position in the retained
+// signal history. It is available only to parsers that request that history.
+func (d Decoder) SignalAt(idx int) float64 {
+	physicalIdx := d.signalGap + idx
+	blockOffset := physicalIdx >> uint(d.signalBlockShift)
+	sampleOffset := physicalIdx & d.signalBlockMask
+	blockIdx := d.signalBlock + 1 + blockOffset
+	if blockIdx >= d.signalBlockCount {
+		blockIdx -= d.signalBlockCount
+	}
+	return d.signalBacking[blockIdx*d.signalBlockStride+d.signalHistoryOverlap+sampleOffset]
+}
+
+// SignalWindow returns a contiguous range from the retained magnitude
+// history. Each block carries enough overlap from its predecessor to make a
+// parser's complete correlation window contiguous across block boundaries.
+func (d Decoder) SignalWindow(idx, length int) []float64 {
+	if length > d.signalHistoryOverlap {
+		panic("protocol: requested signal window exceeds retained overlap")
+	}
+	physicalIdx := d.signalGap + idx
+	blockOffset := physicalIdx >> uint(d.signalBlockShift)
+	sampleOffset := physicalIdx & d.signalBlockMask
+	blockIdx := d.signalBlock + 1 + blockOffset
+	if blockIdx >= d.signalBlockCount {
+		blockIdx -= d.signalBlockCount
+	}
+
+	start := blockIdx*d.signalBlockStride + d.signalHistoryOverlap + sampleOffset
+	if sampleOffset+length > d.Cfg.BlockSize {
+		beforeBoundary := d.Cfg.BlockSize - sampleOffset
+		blockIdx++
+		if blockIdx == d.signalBlockCount {
+			blockIdx = 0
+		}
+		start = blockIdx*d.signalBlockStride + d.signalHistoryOverlap - beforeBoundary
+	}
+	return d.signalBacking[start : start+length]
+}
+
+func (d *Decoder) allocateSignalHistory() {
+	d.signalBlockStride = d.Cfg.BlockSize + d.signalHistoryOverlap
+	d.signalBlockCount = (d.Cfg.BufferLength + d.Cfg.BlockSize - 1) / d.Cfg.BlockSize
+	d.signalBacking = make([]float64, d.signalBlockCount*d.signalBlockStride)
+	d.signalBlock = d.signalBlockCount - 1
+	d.signalBlockShift = bits.TrailingZeros(uint(d.Cfg.BlockSize))
+	d.signalBlockMask = d.Cfg.BlockSize - 1
+	d.signalGap = d.signalBlockCount*d.Cfg.BlockSize - d.Cfg.BufferLength
+	start := d.signalBlock * d.signalBlockStride
+	d.Signal = d.signalBacking[start+d.signalHistoryOverlap-d.Cfg.SymbolLength : start+d.signalBlockStride]
+}
+
+func (d *Decoder) allocateFloatSignal() {
+	d.Signal = nil
+	d.signalBacking = nil
+	if d.signalHistoryOverlap > 0 {
+		d.allocateSignalHistory()
+	} else {
+		d.Signal = make([]float64, d.Cfg.BlockSize+d.Cfg.SymbolLength)
+	}
+	// Calculate magnitude lookup table specified by -fastmag flag.
+	d.demod = NewMagLUT()
 }
 
 // A Demodulator knows how to demodulate an array of uint8 IQ samples into an
@@ -219,6 +445,35 @@ func NewMagLUT() (lut MagLUT) {
 
 // Calculates complex magnitude on given IQ stream writing result to output.
 func (lut MagLUT) Execute(input []byte, output []float64) {
+	if len(output) == 0 {
+		return
+	}
+	// Prove the production table and input lengths once instead of checking
+	// both lookup operands for every complex sample.
+	_ = lut[255]
+	_ = input[len(output)*2-1]
+
+	if magnitudeLUTA72Available() {
+		bulk := len(output) &^ 7
+		if bulk != 0 {
+			magnitudeLUTA72Platform(output[:bulk], input[:bulk*2], lut)
+			input = input[bulk*2:]
+			output = output[bulk:]
+		}
+	}
+	magnitudeLUTGo(input, output, lut)
+}
+
+// Keep the portable loop out of callers: Go 1.26 otherwise loses the bounds
+// proofs above the loop and restores checks for each sample.
+//
+//go:noinline
+func magnitudeLUTGo(input []byte, output []float64, lut []float64) {
+	if len(output) == 0 {
+		return
+	}
+	_ = lut[255]
+	_ = input[len(output)*2-1]
 	i := 0
 	for idx := range output {
 		output[idx] = lut[input[i]] + lut[input[i+1]]
@@ -228,45 +483,281 @@ func (lut MagLUT) Execute(input []byte, output []float64) {
 
 // Matched filter for Manchester coded signals. Output signal's sign at each
 // sample determines the bit-value due to Manchester symbol odd symmetry.
+func filterManchester(output []byte, lowerInput, middleInput, upperInput []float64, lower, upper float64) {
+	n := len(output)
+	if len(lowerInput) < n || len(middleInput) < n || len(upperInput) < n {
+		panic("protocol: Manchester filter input shorter than output")
+	}
+	for idx := range output {
+		f := lower - upper
+		output[idx] = 1 - byte(math.Float64bits(f)>>63)
+		lower += middleInput[idx] - lowerInput[idx]
+		upper += upperInput[idx] - middleInput[idx]
+	}
+}
+
 func (d Decoder) Filter(input []float64, output []byte) {
-	// Computing the cumulative summation over the signal simplifies
-	// filtering to the difference of a pair of subtractions.
-	var sum float64
-	for idx, v := range input {
-		sum += v
-		d.csum[idx+1] = sum
+	chipLength := d.Cfg.ChipLength
+	if filterManchesterA72Platform(input, output, chipLength) {
+		return
+	}
+	var lower, upper float64
+	for idx := 0; idx < chipLength; idx++ {
+		lower += input[idx]
+		upper += input[idx+chipLength]
 	}
 
-	// Filter result is difference of summation of lower and upper chips.
-	lower := d.csum[d.Cfg.ChipLength:]
-	upper := d.csum[d.Cfg.SymbolLength:]
-	for idx, l := range lower[:len(output)] {
-		f := (l - d.csum[idx]) - (upper[idx] - l)
-		output[idx] = 1 - byte(math.Float64bits(f)>>63)
-	}
+	// Advance the two chip windows by one sample after each decision.
+	n := len(output)
+	filterManchester(output, input[:n], input[chipLength:chipLength+n], input[chipLength*2:chipLength*2+n], lower, upper)
 
 	return
 }
 
+func (d *Decoder) ownsQuantizedRing() bool {
+	return len(d.Quantized) == d.Cfg.BufferLength && len(d.Quantized) != 0 &&
+		len(d.quantizedBacking) == d.Cfg.BufferLength+d.Cfg.BlockSize &&
+		&d.Quantized[0] == &d.quantizedBacking[0]
+}
+
+// nextQuantizedOutput advances the logical ring position and returns one
+// contiguous block-sized destination. quantizedBacking extends the physical
+// ring by one block so a cross-boundary producer write never needs a split ABI.
+func (d *Decoder) nextQuantizedOutput() (output []byte, nextStart, tail int) {
+	nextStart = d.quantizedStart + d.Cfg.BlockSize
+	if nextStart >= len(d.Quantized) {
+		nextStart -= len(d.Quantized)
+	}
+	tail = nextStart + d.Cfg.PacketLength
+	if tail >= len(d.Quantized) {
+		tail -= len(d.Quantized)
+	}
+	return d.quantizedBacking[tail : tail+d.Cfg.BlockSize], nextStart, tail
+}
+
+// commitQuantizedOutput restores only the wrapped physical prefix. Ordinary
+// in-ring producer writes need no copy at all.
+func (d *Decoder) commitQuantizedOutput(nextStart, tail, count int) {
+	if end := tail + count; end > len(d.Quantized) {
+		overflow := end - len(d.Quantized)
+		copy(d.Quantized[:overflow], d.quantizedBacking[len(d.Quantized):end])
+	}
+	d.quantizedStart = nextStart
+}
+
+// appendQuantized advances the logical decision history and writes only the
+// newly filtered block. Both lengths are multiples of eight for every decoder
+// configuration, preserving byte alignment for packed preamble searches.
+func (d *Decoder) appendQuantized(block []byte) {
+	d.quantizedStart += d.Cfg.BlockSize
+	if d.quantizedStart >= len(d.Quantized) {
+		d.quantizedStart -= len(d.Quantized)
+	}
+
+	tail := d.quantizedStart + d.Cfg.PacketLength
+	if tail >= len(d.Quantized) {
+		tail -= len(d.Quantized)
+	}
+	first := len(block)
+	if remaining := len(d.Quantized) - tail; remaining < first {
+		first = remaining
+	}
+	copy(d.Quantized[tail:], block[:first])
+	copy(d.Quantized, block[first:])
+}
+
+func (d Decoder) quantizedAt(idx int) byte {
+	idx += d.quantizedStart
+	if idx >= len(d.Quantized) {
+		idx -= len(d.Quantized)
+	}
+	return d.Quantized[idx]
+}
+
 // Return a list of indices into the quantized signal at which a valid preamble
 // exists.
-// 1. Pack the quantized signal into bytes.
-// 2. Build a list of indices by eliminating bytes that contain no bits matching
-//    the first bit of the preamble.
-// 3. Continue eliminating indices at which the preamble cannot exist.
-// 4. Convert indices from byte-based to sample-based.
-// 5. Check each of these indices for the preamble.
+//  1. Pack the quantized signal into bytes.
+//  2. Build a list of indices by eliminating bytes that contain no bits matching
+//     the first bit of the preamble.
+//  3. Continue eliminating indices at which the preamble cannot exist.
+//  4. Convert indices from byte-based to sample-based.
+//  5. Check each of these indices for the preamble.
 func (d *Decoder) Search(preamble []byte) []int {
-	symLenByte := d.Cfg.SymbolLength >> 3
-
 	// Pack the bit-wise quantized signal into bytes.
-	for bIdx := range d.packed {
-		var b byte
-		for _, qBit := range d.Quantized[bIdx<<3 : (bIdx+1)<<3] {
-			b = (b << 1) | qBit
-		}
-		d.packed[bIdx] = b
+	packQuantizedRing(d.packed, d.Quantized, d.quantizedStart)
+	return d.searchPacked(preamble)
+}
+
+func (d *Decoder) searchPacked(preamble []byte) []int {
+	if d.Cfg.SymbolLength&7 == 0 {
+		return d.searchPackedByteAligned(preamble)
 	}
+	return d.searchPackedLegacy(preamble)
+}
+
+// searchPackedByteAligned tests all eight sample phases represented by a
+// packed byte at once. Symbol alignment keeps every preamble decision at the
+// same bit position in its respective byte.
+func (d *Decoder) searchPackedByteAligned(preamble []byte) []int {
+	symLenByte := d.Cfg.SymbolLength >> 3
+	d.sIdxA = d.sIdxA[:0]
+	if len(preamble) < 4 {
+		return d.searchPackedByteAlignedGeneric(preamble, symLenByte)
+	}
+	blockBytes := d.Cfg.BlockSize >> 3
+	if len(preamble) == 32 && blockBytes&15 == 0 {
+		if len(d.alignedMasks) != blockBytes {
+			d.alignedMasks = make([]byte, blockBytes)
+		}
+		if fixedIndices, ok := searchAlignedCandidates32FixedPlatform(preamble, d.alignedMasks, d.packed, symLenByte, d.sIdxA); ok {
+			d.sIdxA = fixedIndices
+			return d.sIdxA
+		}
+	}
+	if len(preamble) == 32 && blockBytes&15 == 0 && searchAlignedCandidates4Available() {
+		if len(d.alignedMasks) != blockBytes {
+			d.alignedMasks = make([]byte, blockBytes)
+		}
+		var masks [32]byte
+		for idx, pBit := range preamble {
+			masks[idx] = (pBit ^ 1) * 0xff
+		}
+		d.sIdxA = searchAlignedCandidates32Platform(d.alignedMasks, d.packed, symLenByte, masks[:], d.sIdxA)
+		return d.sIdxA
+	}
+	if (len(preamble) == 16 || len(preamble) == 21) && blockBytes&63 == 0 {
+		if len(d.alignedMasks) != blockBytes {
+			d.alignedMasks = make([]byte, blockBytes)
+		}
+		if fixedIndices, ok := searchAlignedCandidates4FixedPlatform(preamble, d.alignedMasks, d.packed, symLenByte, d.sIdxA); ok {
+			d.sIdxA = fixedIndices
+			return d.sIdxA
+		}
+	}
+	m0 := (preamble[0] ^ 1) * 0xff
+	m1 := (preamble[1] ^ 1) * 0xff
+	m2 := (preamble[2] ^ 1) * 0xff
+	m3 := (preamble[3] ^ 1) * 0xff
+	if blockBytes&15 == 0 && searchAlignedCandidates4Available() {
+		if len(d.alignedMasks) != blockBytes {
+			d.alignedMasks = make([]byte, blockBytes)
+		}
+		masks := [4]byte{m0, m1, m2, m3}
+		searchAlignedCandidates4Platform(d.alignedMasks, d.packed, symLenByte, masks)
+		return d.finishAlignedCandidates(preamble, symLenByte, d.alignedMasks)
+	}
+
+	for qByte := 0; qByte < blockBytes; qByte++ {
+		candidates := (d.packed[qByte] ^ m0) &
+			(d.packed[qByte+symLenByte] ^ m1) &
+			(d.packed[qByte+symLenByte*2] ^ m2) &
+			(d.packed[qByte+symLenByte*3] ^ m3)
+		if candidates != 0 {
+			for relativeIdx, pBit := range preamble[4:] {
+				pIdx := relativeIdx + 4
+				signal := d.packed[qByte+pIdx*symLenByte]
+				candidates &= signal ^ ((pBit ^ 1) * 0xff)
+				if candidates == 0 {
+					break
+				}
+			}
+		}
+
+		// Packed decisions are MSB-first, so leading-zero order preserves the
+		// sample-index order returned by the legacy search.
+		for candidates != 0 {
+			phase := bits.LeadingZeros8(candidates)
+			d.sIdxA = append(d.sIdxA, (qByte<<3)+phase)
+			candidates &^= byte(0x80 >> uint(phase))
+		}
+	}
+
+	return d.sIdxA
+}
+
+func (d *Decoder) expandAlignedCandidates(candidateMasks []byte) []int {
+	for qByte, candidates := range candidateMasks {
+		for candidates != 0 {
+			phase := bits.LeadingZeros8(candidates)
+			d.sIdxA = append(d.sIdxA, (qByte<<3)+phase)
+			candidates &^= byte(0x80 >> uint(phase))
+		}
+	}
+	return d.sIdxA
+}
+
+// finishAlignedCandidates checks the remainder of the preamble only for
+// byte positions whose first four symbols have at least one matching phase.
+func (d *Decoder) finishAlignedCandidates(preamble []byte, symLenByte int, candidateMasks []byte) []int {
+	for qByte, candidates := range candidateMasks {
+		if candidates != 0 {
+			for relativeIdx, pBit := range preamble[4:] {
+				pIdx := relativeIdx + 4
+				signal := d.packed[qByte+pIdx*symLenByte]
+				candidates &= signal ^ ((pBit ^ 1) * 0xff)
+				if candidates == 0 {
+					break
+				}
+			}
+		}
+
+		for candidates != 0 {
+			phase := bits.LeadingZeros8(candidates)
+			d.sIdxA = append(d.sIdxA, (qByte<<3)+phase)
+			candidates &^= byte(0x80 >> uint(phase))
+		}
+	}
+	return d.sIdxA
+}
+
+func searchAlignedCandidates4Go(dst, packed []byte, symLenByte int, masks [4]byte) {
+	if len(dst) == 0 {
+		return
+	}
+	_ = packed[len(dst)-1+symLenByte*3]
+	for qByte := range dst {
+		dst[qByte] = (packed[qByte] ^ masks[0]) &
+			(packed[qByte+symLenByte] ^ masks[1]) &
+			(packed[qByte+symLenByte*2] ^ masks[2]) &
+			(packed[qByte+symLenByte*3] ^ masks[3])
+	}
+}
+
+func searchAlignedCandidates32Go(dst, packed []byte, symLenByte int, masks []byte) {
+	if len(dst) == 0 {
+		return
+	}
+	if len(masks) != 32 {
+		panic("protocol: 32-symbol search requires exactly 32 masks")
+	}
+	_ = packed[len(dst)-1+symLenByte*(len(masks)-1)]
+	for qByte := range dst {
+		candidates := byte(0xff)
+		for pIdx, mask := range masks {
+			candidates &= packed[qByte+pIdx*symLenByte] ^ mask
+		}
+		dst[qByte] = candidates
+	}
+}
+
+func (d *Decoder) searchPackedByteAlignedGeneric(preamble []byte, symLenByte int) []int {
+	for qByte := 0; qByte < d.Cfg.BlockSize>>3; qByte++ {
+		candidates := byte(0xff)
+		for pIdx, pBit := range preamble {
+			signal := d.packed[qByte+pIdx*symLenByte]
+			candidates &= signal ^ ((pBit ^ 1) * 0xff)
+		}
+		for candidates != 0 {
+			phase := bits.LeadingZeros8(candidates)
+			d.sIdxA = append(d.sIdxA, (qByte<<3)+phase)
+			candidates &^= byte(0x80 >> uint(phase))
+		}
+	}
+	return d.sIdxA
+}
+
+func (d *Decoder) searchPackedLegacy(preamble []byte) []int {
+	symLenByte := d.Cfg.SymbolLength >> 3
 
 	// For each bit in the preamble.
 	for pIdx, pBit := range preamble {
@@ -316,10 +807,8 @@ func (d *Decoder) Search(preamble []byte) []int {
 	// Check which indices the preamble actually exists at.
 	for pIdx, pBit := range preamble {
 		offset := pIdx * symLen
-		offsetQuantized := d.Quantized[offset : offset+d.Cfg.BlockSize]
-
 		// Search the list of possible indices for indices at which the preamble actually exists.
-		d.sIdxB, d.sIdxA = searchPass(pBit, offsetQuantized, d.sIdxA, d.sIdxB[:0])
+		d.sIdxB, d.sIdxA = searchPassRing(pBit, d.Quantized, d.quantizedStart+offset, d.sIdxA, d.sIdxB[:0])
 
 		// If at the current bit of the preamble, there are no indices left to
 		// check, the preamble does not exist in the current sample block.
@@ -329,6 +818,32 @@ func (d *Decoder) Search(preamble []byte) []int {
 	}
 
 	return d.sIdxA
+}
+
+func packQuantized(dst, src []byte) {
+	for byteIdx := range dst {
+		srcIdx := byteIdx << 3
+		decisions := binary.LittleEndian.Uint64(src[srcIdx : srcIdx+8])
+		dst[byteIdx] = byte((decisions * 0x8040201008040201) >> 56)
+	}
+}
+
+func packQuantizedRing(dst, src []byte, start int) {
+	if start == 0 {
+		packQuantized(dst, src)
+		return
+	}
+
+	bitsNeeded := len(dst) << 3
+	bitsBeforeWrap := len(src) - start
+	if bitsNeeded <= bitsBeforeWrap {
+		packQuantized(dst, src[start:start+bitsNeeded])
+		return
+	}
+
+	firstBytes := bitsBeforeWrap >> 3
+	packQuantized(dst[:firstBytes], src[start:])
+	packQuantized(dst[firstBytes:], src[:bitsNeeded-bitsBeforeWrap])
 }
 
 func searchPassByte(pBit byte, sig []byte, a, b []int) ([]int, []int) {
@@ -351,10 +866,31 @@ func searchPass(pBit byte, sig []byte, a, b []int) ([]int, []int) {
 	return a, b
 }
 
+func searchPassRing(pBit byte, sig []byte, start int, a, b []int) ([]int, []int) {
+	if start >= len(sig) {
+		start -= len(sig)
+	}
+	for _, qIdx := range a {
+		idx := start + qIdx
+		if idx >= len(sig) {
+			idx -= len(sig)
+		}
+		if sig[idx] == pBit {
+			b = append(b, qIdx)
+		}
+	}
+
+	return a, b
+}
+
 // Given a list of indices the preamble exists at, sample the appropriate bits
 // of the signal's bit-decision. Pack bits of each index into an array of bytes
 // and return each packet.
 func (d Decoder) Slice(indices []int) (pkts []Data) {
+	return d.slice(indices, true)
+}
+
+func (d Decoder) slice(indices []int, includeBits bool) (pkts []Data) {
 	// For each of the indices the preamble exists at.
 	for _, qIdx := range indices {
 		// Check that we're still within the first sample block. We'll catch
@@ -363,14 +899,33 @@ func (d Decoder) Slice(indices []int) (pkts []Data) {
 			continue
 		}
 
-		// Packet is 1 bit per byte, pack to 8-bits per byte.
-		for pIdx := 0; pIdx < d.Cfg.PacketSymbols; pIdx++ {
-			d.pkt[pIdx>>3] <<= 1
-			d.pkt[pIdx>>3] |= d.Quantized[qIdx+(pIdx*d.Cfg.SymbolLength)]
+		// Walk the decision ring once and assemble each output byte in a
+		// register. This avoids a multiply, modulo-style ring lookup, and
+		// read/modify/write of d.pkt for every packet symbol.
+		qPhysical := d.quantizedStart + qIdx
+		if qPhysical >= len(d.Quantized) {
+			qPhysical -= len(d.Quantized)
+		}
+		remainingSymbols := d.Cfg.PacketSymbols
+		for packetByte := range d.pkt {
+			bitsInByte := 8
+			if remainingSymbols < bitsInByte {
+				bitsInByte = remainingSymbols
+			}
+			value := d.pkt[packetByte]
+			for bit := 0; bit < bitsInByte; bit++ {
+				value = value<<1 | d.Quantized[qPhysical]
+				qPhysical += d.Cfg.SymbolLength
+				if qPhysical >= len(d.Quantized) {
+					qPhysical -= len(d.Quantized)
+				}
+			}
+			d.pkt[packetByte] = value
+			remainingSymbols -= bitsInByte
 		}
 
 		// Store the packet in the seen map and append to the packet list.
-		data := NewData(d.pkt)
+		data := newData(d.pkt, includeBits)
 		data.Idx = qIdx
 		pkts = append(pkts, data)
 	}

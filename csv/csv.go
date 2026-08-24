@@ -26,13 +26,18 @@ func NewEncoder(w io.Writer) *Encoder {
 // newline character. Value given must implement the Recorder interface.
 func (enc *Encoder) Encode(v interface{}) (err error) {
 	defer func() {
-		if err, _ = recover().(error); err != nil {
-			err = xerrors.Errorf("recovered: %w", err)
+		if recovered := recover(); recovered != nil {
+			if recoveredErr, ok := recovered.(error); ok {
+				err = xerrors.Errorf("recovered: %w", recoveredErr)
+			} else {
+				err = xerrors.Errorf("recovered: %v", recovered)
+			}
 		}
 	}()
 
-	err = enc.w.Write(v.(Recorder).Record())
+	if err = enc.w.Write(v.(Recorder).Record()); err != nil {
+		return err
+	}
 	enc.w.Flush()
-
-	return nil
+	return enc.w.Error()
 }

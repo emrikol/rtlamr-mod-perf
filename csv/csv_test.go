@@ -3,7 +3,10 @@ package csv
 import (
 	"bytes"
 	"encoding/csv"
+	"errors"
+	"io"
 	"runtime"
+	"strings"
 	"testing"
 
 	"golang.org/x/xerrors"
@@ -44,5 +47,36 @@ func TestNonRecorder(t *testing.T) {
 	var runtimeErr runtime.Error
 	if !xerrors.As(err, &runtimeErr) {
 		t.Fatalf("%+v\n", runtimeErr)
+	}
+}
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+func TestEncodeReturnsFlushError(t *testing.T) {
+	want := errors.New("write failed")
+	enc := NewEncoder(failingWriter{err: want})
+
+	if err := enc.Encode(Msg{}); !errors.Is(err, want) {
+		t.Fatalf("Encode error = %v, want %v", err, want)
+	}
+}
+
+type panicRecorder struct{}
+
+func (panicRecorder) Record() []string {
+	panic("record failed")
+}
+
+func TestEncodeRecoversNonErrorPanic(t *testing.T) {
+	enc := NewEncoder(io.Discard)
+	err := enc.Encode(panicRecorder{})
+	if err == nil || !strings.Contains(err.Error(), "record failed") {
+		t.Fatalf("Encode error = %v, want recovered panic", err)
 	}
 }

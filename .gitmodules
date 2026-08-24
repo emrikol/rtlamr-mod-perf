@@ -1,0 +1,3 @@
+[submodule "third_party/rtl-sdr"]
+	path = third_party/rtl-sdr
+	url = https://gitea.osmocom.org/sdr/rtl-sdr.git

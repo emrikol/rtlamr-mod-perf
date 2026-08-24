@@ -20,7 +20,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
-	"sync"
 
 	"github.com/bemasher/rtlamr/crc"
 	"github.com/bemasher/rtlamr/protocol"
@@ -58,7 +57,7 @@ func (p *Parser) Cfg() protocol.PacketConfig {
 	return p.cfg
 }
 
-func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sync.WaitGroup) {
+func (p Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
 	seen := make(map[string]bool)
 
 	for _, pkt := range pkts {
@@ -84,10 +83,10 @@ func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *syn
 			continue
 		}
 
-		msgCh <- scm
+		messages = append(messages, scm)
 	}
 
-	wg.Done()
+	return messages
 }
 
 // Standard Consumption Message

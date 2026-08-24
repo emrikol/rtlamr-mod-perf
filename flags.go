@@ -34,8 +34,16 @@ import (
 )
 
 var (
-	sampleFile   = flag.String("samplefile", os.DevNull, "raw signal dump file")
-	sampleWriter = io.Discard
+	sampleFile               = flag.String("samplefile", os.DevNull, "packet-triggered raw signal dump file")
+	sampleWriter             = io.Discard
+	continuousSampleFile     = flag.String("continuoussamplefile", os.DevNull, "bounded continuous raw signal dump file")
+	continuousSampleDuration = flag.Duration("continuoussampleduration", 0, "amount of raw signal to capture; required with -continuoussamplefile")
+	continuousSampleWriter   = io.Discard
+)
+
+var (
+	inputSource  = flag.String("source", "tcp", "sample source: tcp or direct")
+	directDevice = flag.String("device", "0", "RTL-SDR device index or serial for the direct source")
 )
 
 var msgType StringMap
@@ -59,6 +67,15 @@ var single = flag.Bool("single", false, "one shot execution, if used with -filte
 
 var version = flag.Bool("version", false, "display build date and commit hash")
 
+var (
+	cpuProfile                 = flag.String("cpuprofile", "", "write a CPU profile to this file")
+	cpuProfileDuration         = flag.Duration("cpuprofileduration", 0, "stop CPU profiling after this duration, 0 for process lifetime")
+	dutySchedulerMode          = flag.String("dutyscheduler", "off", "DSP duty scheduler mode: off, shadow, or gated")
+	dutySchedulerCaptureTarget = flag.Float64("dutyschedulercapturetarget", 99.5, "per-sender scheduler capture target percentage (greater than 0 and less than 100)")
+	dutySchedulerReport        = flag.String("dutyschedulerreport", "", "write the final DSP duty scheduler report as JSON")
+	dutySchedulerCheckpointDir = flag.String("dutyschedulercheckpointdir", "", "resume the strongest compatible checkpoint, then write hourly atomic DSP duty scheduler state in this existing directory")
+)
+
 func RegisterFlags() {
 	msgType = StringMap{"scm": true}
 	flag.Var(msgType, "msgtype", "comma-separated list of message types to receive: all, scm, scm+, idm, netidm, r900 and r900bcd")
@@ -70,17 +87,26 @@ func RegisterFlags() {
 	flag.Var(meterType, "filtertype", "display only messages matching a type in a comma-separated list of types.")
 
 	rtlamrFlags := map[string]bool{
-		"samplefile":   true,
-		"msgtype":      true,
-		"symbollength": true,
-		"duration":     true,
-		"filterid":     true,
-		"filtertype":   true,
-		"format":       true,
-		"unique":       true,
-		"single":       true,
-		"cpuprofile":   true,
-		"version":      true,
+		"samplefile":                 true,
+		"continuoussamplefile":       true,
+		"continuoussampleduration":   true,
+		"msgtype":                    true,
+		"symbollength":               true,
+		"duration":                   true,
+		"filterid":                   true,
+		"filtertype":                 true,
+		"format":                     true,
+		"unique":                     true,
+		"single":                     true,
+		"cpuprofile":                 true,
+		"cpuprofileduration":         true,
+		"dutyscheduler":              true,
+		"dutyschedulercapturetarget": true,
+		"dutyschedulerreport":        true,
+		"dutyschedulercheckpointdir": true,
+		"version":                    true,
+		"source":                     true,
+		"device":                     true,
 	}
 
 	printDefaults := func(validFlags map[string]bool, inclusion bool) {
@@ -123,6 +149,9 @@ func EnvOverride() {
 
 func HandleFlags() {
 	var err error
+	if *dutySchedulerCaptureTarget <= 0 || *dutySchedulerCaptureTarget >= 100 {
+		log.Fatal("dutyschedulercapturetarget must be greater than 0 and less than 100")
+	}
 
 	switch *symbolLength {
 	case 8, 32, 40, 48, 56, 64, 72, 80, 88, 96:
@@ -131,23 +160,63 @@ func HandleFlags() {
 		log.Fatal("invalid symbollength")
 	}
 
+	*format = strings.ToLower(*format)
+	encoder, err = newOutputEncoder(*format, os.Stdout, *sampleFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	if *sampleFile != os.DevNull {
 		sampleWriter, err = os.Create(*sampleFile)
 		if err != nil {
 			log.Fatal("Error creating sample file:", err)
 		}
 	}
+	if *continuousSampleFile != os.DevNull {
+		if *continuousSampleDuration <= 0 {
+			log.Fatal("continuoussampleduration must be positive when continuoussamplefile is set")
+		}
+		continuousSampleWriter, err = os.Create(*continuousSampleFile)
+		if err != nil {
+			log.Fatal("Error creating continuous sample file:", err)
+		}
+	} else if *continuousSampleDuration != 0 {
+		log.Fatal("continuoussamplefile must be set when continuoussampleduration is non-zero")
+	}
 
-	*format = strings.ToLower(*format)
-	switch *format {
+	*dutySchedulerMode = strings.ToLower(*dutySchedulerMode)
+	switch *dutySchedulerMode {
+	case "off":
+		if *dutySchedulerReport != "" || *dutySchedulerCheckpointDir != "" {
+			log.Fatal("dutyscheduler report and checkpoint directory require dutyscheduler=shadow or gated")
+		}
+	case "shadow", "gated":
+		if *dutySchedulerReport == "" {
+			log.Fatal("dutyschedulerreport is required when dutyscheduler is enabled")
+		}
+		if len(meterID.UintMap) == 0 {
+			log.Fatal("dutyscheduler requires an explicit filterid sender inventory")
+		}
+		if *dutySchedulerMode == "gated" && (*sampleFile != os.DevNull || *single) {
+			log.Fatal("gated dutyscheduler is incompatible with samplefile and single")
+		}
+	default:
+		log.Fatal("invalid dutyscheduler mode")
+	}
+}
+
+func newOutputEncoder(outputFormat string, output io.Writer, sampleFilename string) (Encoder, error) {
+	switch strings.ToLower(outputFormat) {
 	case "plain":
-		encoder = PlainEncoder{*sampleFile}
+		return PlainEncoder{sampleFilename}, nil
 	case "csv":
-		encoder = csv.NewEncoder(os.Stdout)
+		return csv.NewEncoder(output), nil
 	case "json":
-		encoder = json.NewEncoder(os.Stdout)
+		return json.NewEncoder(output), nil
 	case "xml":
-		encoder = NewLineEncoder{xml.NewEncoder(os.Stdout)}
+		return NewLineEncoder{xml.NewEncoder(output)}, nil
+	default:
+		return nil, fmt.Errorf("invalid output format %q", outputFormat)
 	}
 }
 

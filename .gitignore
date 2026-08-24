@@ -7,3 +7,14 @@ desktop.ini
 *~
 # Added by goreleaser init:
 dist/
+profiles/
+
+# Private operational and experiment material belongs in the workspace, never
+# in this public repository.
+/AGENTS.md
+/ARM-OPTIMIZATION-REGISTRY.md
+/CORTEX-A72-OPTIMIZATION.md
+/EXPERIMENT-WORKFLOW.md
+/PERFORMANCE-EXPERIMENTS.md
+/TODO.md
+/performance-artifacts/

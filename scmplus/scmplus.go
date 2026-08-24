@@ -21,7 +21,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
-	"sync"
 
 	"github.com/bemasher/rtlamr/crc"
 	"github.com/bemasher/rtlamr/protocol"
@@ -59,7 +58,7 @@ func NewParser(chipLength int) (p protocol.Parser) {
 	}
 }
 
-func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sync.WaitGroup) {
+func (p Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
 	seen := make(map[string]bool)
 
 	for _, pkt := range pkts {
@@ -85,10 +84,10 @@ func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *syn
 			continue
 		}
 
-		msgCh <- scm
+		messages = append(messages, scm)
 	}
 
-	wg.Done()
+	return messages
 }
 
 // Standard Consumption Message Plus
@@ -99,7 +98,7 @@ type SCM struct {
 	EndpointID   uint32 `xml:",attr"`
 	Consumption  uint32 `xml:",attr"`
 	Tamper       uint16 `xml:",attr"`
-	PacketCRC    uint16 `xml:"Checksum,attr",json:"Checksum"`
+	PacketCRC    uint16 `xml:"Checksum,attr" json:"Checksum"`
 }
 
 func NewSCM(data protocol.Data) (scm SCM) {

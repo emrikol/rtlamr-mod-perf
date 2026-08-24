@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/bemasher/rtlamr/crc"
 	"github.com/bemasher/rtlamr/protocol"
@@ -70,7 +69,7 @@ func NewParser(chipLength int) (p protocol.Parser) {
 	}
 }
 
-func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *sync.WaitGroup) {
+func (p Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
 	seen := make(map[string]bool)
 
 	for _, pkt := range pkts {
@@ -104,10 +103,10 @@ func (p Parser) Parse(pkts []protocol.Data, msgCh chan protocol.Message, wg *syn
 			continue
 		}
 
-		msgCh <- netidm
+		messages = append(messages, netidm)
 	}
 
-	wg.Done()
+	return messages
 }
 
 // Net Meter Interval Data Message
