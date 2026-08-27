@@ -26,6 +26,7 @@ type dutyCheckpointCandidate struct {
 	sampleRemainder int64
 	evidence        uint64
 	exact           bool
+	targetMigration bool
 	policyMigration bool
 	modeMigration   bool
 }
@@ -103,6 +104,8 @@ func (d *dutyRuntime) restoreBestCheckpoint() error {
 		status = "RESTORED_EXACT"
 	} else if chosen.modeMigration {
 		status = "RESTORED_SHADOW_TO_GATED"
+	} else if chosen.targetMigration {
+		status = "RESTORED_CAPTURE_TARGET"
 	} else if chosen.policyMigration {
 		status = "RESTORED_POLICY_MIGRATION"
 	}
@@ -144,6 +147,7 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 		return dutyCheckpointCandidate{}, err
 	}
 	exact := false
+	targetMigration := false
 	policyMigration := false
 	modeMigration := false
 	if report.Schema == "rtlamr-duty-scheduler-live-v3" || report.Schema == "rtlamr-duty-scheduler-live-v4" {
@@ -160,6 +164,15 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 				return dutyCheckpointCandidate{}, err
 			}
 			modeMigration = true
+		case errors.Is(err, dutyscheduler.ErrStateConfigurationMismatch) && report.Mode == d.mode && report.CaptureTarget != schedulerConfig.CaptureTarget:
+			if targetErr := scheduler.RestoreCaptureTargetState(report.SchedulerState, report.CaptureTarget); targetErr == nil {
+				targetMigration = true
+				break
+			}
+			if err := scheduler.RestoreLegacySnapshot(report.Snapshot); err != nil {
+				return dutyCheckpointCandidate{}, err
+			}
+			policyMigration = true
 		case errors.Is(err, dutyscheduler.ErrStateConfigurationMismatch), errors.Is(err, dutyscheduler.ErrStateSchemaMismatch):
 			if err := scheduler.RestoreLegacySnapshot(report.Snapshot); err != nil {
 				return dutyCheckpointCandidate{}, err
@@ -179,7 +192,7 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 	if err != nil || int64(expectedTime) != report.Snapshot.SampleTimeNS {
 		return dutyCheckpointCandidate{}, errors.New("dutyscheduler: checkpoint sample clock mismatch")
 	}
-	if exact && report.SampleRemainder != remainder {
+	if (exact || targetMigration) && report.SampleRemainder != remainder {
 		return dutyCheckpointCandidate{}, errors.New("dutyscheduler: checkpoint sample remainder mismatch")
 	}
 	sum := sha256.Sum256(contents)
@@ -191,6 +204,7 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 		sampleRemainder: remainder,
 		evidence:        dutyEvidenceCount(report.Snapshot),
 		exact:           exact,
+		targetMigration: targetMigration,
 		policyMigration: policyMigration,
 		modeMigration:   modeMigration,
 	}, nil

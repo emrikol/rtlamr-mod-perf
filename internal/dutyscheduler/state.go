@@ -239,6 +239,48 @@ func (s *Scheduler) RestoreState(state State) error {
 	return nil
 }
 
+// RestoreCaptureTargetState restores a complete checkpoint whose normalized
+// configuration differs only by CaptureTarget. Cadence models, watchdogs, and
+// evidence are independent of that statistical threshold and are retained.
+// Qualification is deliberately restarted under the new target so a prior
+// decision or partially elapsed promotion window cannot cross contracts.
+func (s *Scheduler) RestoreCaptureTargetState(state State, previousCaptureTarget float64) error {
+	if state.Schema != StateSchema {
+		return fmt.Errorf("%w %q", ErrStateSchemaMismatch, state.Schema)
+	}
+	previousConfig := s.cfg
+	previousConfig.CaptureTarget = previousCaptureTarget
+	if _, err := New(previousConfig); err != nil {
+		return err
+	}
+	fingerprint, err := configSHA256(previousConfig)
+	if err != nil {
+		return err
+	}
+	if state.ConfigSHA256 != fingerprint {
+		return ErrStateConfigurationMismatch
+	}
+	restored, err := New(s.cfg)
+	if err != nil {
+		return err
+	}
+	if err := restored.applyState(state); err != nil {
+		return err
+	}
+	for _, candidate := range restored.candidates {
+		candidate.qualified = false
+		candidate.promotionReady = 0
+	}
+	restored.selected = nil
+	restored.quietActive = false
+	restored.auditActive = false
+	restored.quietCandidate = ""
+	restored.refreshQualifications(restored.lastEnd)
+	restored.chooseCandidate()
+	*s = *restored
+	return nil
+}
+
 // RestoreShadowState promotes a compatible shadow checkpoint into gated mode.
 // Complete evidence and learned models are retained, but applyState forces a
 // fresh fail-open recovery interval before any DSP suppression can occur.

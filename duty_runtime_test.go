@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -346,6 +347,10 @@ func TestDutyCheckpointMigratesCaptureTargetWithoutLosingEvidence(t *testing.T) 
 		t.Fatal(err)
 	}
 	wantEvidence := dutyEvidenceCount(original.scheduler.Snapshot())
+	wantState, err := original.scheduler.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	migrated, err := newDutyRuntimeWithCaptureTarget("shadow", dutyTestConfig(), dutyTestSenders, 0.995)
 	if err != nil {
@@ -354,12 +359,23 @@ func TestDutyCheckpointMigratesCaptureTargetWithoutLosingEvidence(t *testing.T) 
 	if err := migrated.configureCheckpoints(directory, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if migrated.resume.Status != "RESTORED_POLICY_MIGRATION" || dutyEvidenceCount(migrated.scheduler.Snapshot()) != wantEvidence {
-		t.Fatalf("policy migration lost evidence: resume=%+v evidence=%d want=%d", migrated.resume, dutyEvidenceCount(migrated.scheduler.Snapshot()), wantEvidence)
+	if migrated.resume.Status != "RESTORED_CAPTURE_TARGET" || dutyEvidenceCount(migrated.scheduler.Snapshot()) != wantEvidence {
+		t.Fatalf("capture-target migration lost evidence: resume=%+v evidence=%d want=%d", migrated.resume, dutyEvidenceCount(migrated.scheduler.Snapshot()), wantEvidence)
 	}
-	for _, candidate := range migrated.scheduler.Snapshot().Candidates {
-		if candidate.Eligible {
-			t.Fatalf("migrated candidate %s bypassed safe cadence relearning", candidate.Name)
+	migratedState, err := migrated.scheduler.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(migratedState.Senders, wantState.Senders) || !reflect.DeepEqual(migratedState.Protocols, wantState.Protocols) {
+		t.Fatal("capture-target migration changed sender or protocol state")
+	}
+	for idx, candidate := range migratedState.Candidates {
+		want := wantState.Candidates[idx]
+		if !reflect.DeepEqual(candidate.Senders, want.Senders) {
+			t.Fatalf("capture-target migration changed candidate %s evidence or cadence", candidate.Name)
+		}
+		if candidate.Qualified {
+			t.Fatalf("capture-target migration retained candidate %s qualification", candidate.Name)
 		}
 	}
 	if err := migrated.maybeCheckpoint(original.startedUTC.Add(time.Hour + time.Minute)); err != nil {
@@ -374,6 +390,42 @@ func TestDutyCheckpointMigratesCaptureTargetWithoutLosingEvidence(t *testing.T) 
 	}
 	if exact.resume.Status != "RESTORED_EXACT" || dutyEvidenceCount(exact.scheduler.Snapshot()) != wantEvidence {
 		t.Fatalf("migrated receipt did not restore exactly: resume=%+v", exact.resume)
+	}
+}
+
+func TestDutyCheckpointTargetMigrationRejectsAdditionalPolicyChange(t *testing.T) {
+	directory := t.TempDir()
+	originalConfig := dutyscheduler.DefaultConfig(dutyscheduler.ModeShadow, dutyTestSenders)
+	originalConfig.CaptureTarget = 0.999
+	original, err := newDutyRuntimeWithConfig(dutyTestConfig(), dutyTestSenders, originalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := original.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	advanceDutyRuntime(original, 12_000)
+	if err := original.writeCheckpoint(original.startedUTC.Add(time.Hour), "hourly"); err != nil {
+		t.Fatal(err)
+	}
+
+	changedConfig := originalConfig
+	changedConfig.CaptureTarget = 0.995
+	changedConfig.RefreshInterval = 8 * time.Hour
+	migrated, err := newDutyRuntimeWithConfig(dutyTestConfig(), dutyTestSenders, changedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrated.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.resume.Status != "RESTORED_POLICY_MIGRATION" {
+		t.Fatalf("additional policy change resumed as %s, want RESTORED_POLICY_MIGRATION", migrated.resume.Status)
+	}
+	for _, candidate := range migrated.scheduler.Snapshot().Candidates {
+		if candidate.Eligible {
+			t.Fatalf("additional policy change retained candidate %s cadence", candidate.Name)
+		}
 	}
 }
 
@@ -553,7 +605,7 @@ func TestDutyRestoreExternalCheckpoint(t *testing.T) {
 	if err := runtime.configureCheckpoints(directory, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if runtime.resume.Status != "RESTORED_LEGACY" && runtime.resume.Status != "RESTORED_EXACT" && runtime.resume.Status != "RESTORED_POLICY_MIGRATION" {
+	if runtime.resume.Status != "RESTORED_LEGACY" && runtime.resume.Status != "RESTORED_EXACT" && runtime.resume.Status != "RESTORED_CAPTURE_TARGET" && runtime.resume.Status != "RESTORED_POLICY_MIGRATION" {
 		t.Fatalf("external checkpoint was not restored: %+v", runtime.resume)
 	}
 	if runtime.decodedBlocks == 0 || dutyEvidenceCount(runtime.scheduler.Snapshot()) == 0 {
@@ -577,6 +629,71 @@ func TestDutyRestoreExternalCheckpoint(t *testing.T) {
 	if exact.resume.Status != "RESTORED_EXACT" || dutyEvidenceCount(exact.scheduler.Snapshot()) != dutyEvidenceCount(runtime.scheduler.Snapshot()) {
 		t.Fatalf("legacy-to-exact continuation failed: resume=%+v", exact.resume)
 	}
+}
+
+func TestDutyRestoreExternalCaptureTarget(t *testing.T) {
+	checkpointPath := os.Getenv("RTLAMR_DUTY_TARGET_CHECKPOINT")
+	policyPath := os.Getenv("RTLAMR_DUTY_POLICY")
+	targetText := os.Getenv("RTLAMR_DUTY_CAPTURE_TARGET")
+	if checkpointPath == "" || targetText == "" {
+		t.Skip("external target checkpoint and target are not set")
+	}
+	target, err := strconv.ParseFloat(targetText, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(checkpointPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source dutyRuntimeReport
+	if err := json.Unmarshal(contents, &source); err != nil {
+		t.Fatal(err)
+	}
+	if source.WarmupBlocks < 1 || source.BlockSamples < 1 || source.BlockBytes < 1 || source.SampleRate < 1 {
+		t.Fatal("external checkpoint has invalid runtime geometry")
+	}
+	packetConfig := protocol.PacketConfig{
+		SampleRate:   int(source.SampleRate),
+		BlockSize:    int(source.BlockSamples),
+		BlockSize2:   source.BlockBytes,
+		BufferLength: (source.WarmupBlocks-1)*int(source.BlockSamples) + 1,
+	}
+	schedulerConfig, err := loadDutySchedulerConfig(source.Mode, source.SenderIDs, target, policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := newDutyRuntimeWithConfig(packetConfig, source.SenderIDs, schedulerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	checkpointName := filepath.Base(checkpointPath)
+	if err := os.WriteFile(filepath.Join(directory, checkpointName), contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.resume.Status != "RESTORED_CAPTURE_TARGET" {
+		t.Fatalf("external target checkpoint resumed as %s", runtime.resume.Status)
+	}
+	restored, err := runtime.scheduler.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(restored.Senders, source.SchedulerState.Senders) || !reflect.DeepEqual(restored.Protocols, source.SchedulerState.Protocols) {
+		t.Fatal("external target migration changed sender or protocol state")
+	}
+	for idx, candidate := range restored.Candidates {
+		if !reflect.DeepEqual(candidate.Senders, source.SchedulerState.Candidates[idx].Senders) {
+			t.Fatalf("external target migration changed candidate %s evidence or cadence", candidate.Name)
+		}
+		if candidate.Qualified {
+			t.Fatalf("external target migration retained candidate %s qualification", candidate.Name)
+		}
+	}
+	t.Logf("status=%s source_sequence=%d blocks=%d evidence=%d", runtime.resume.Status, runtime.resume.SourceSequence, runtime.decodedBlocks, dutyEvidenceCount(runtime.scheduler.Snapshot()))
 }
 
 func TestDutyShadowPreservesExternalCorpusMessages(t *testing.T) {

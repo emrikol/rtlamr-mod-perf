@@ -135,10 +135,14 @@ Qualification is per sender. The default capture target is 99.5% at one-sided
 95% confidence, which requires 598 clean eligible observations before a
 zero-miss sender can qualify. The target is adjustable with
 `-dutyschedulercapturetarget`. Checkpoints are atomic and versioned; compatible
-state resumes exactly, while policy changes retain eligible evidence but force
-cadence relearning. Compatible shadow checkpoints may be promoted into gated
-mode without repeating the entire evidence run, but every promotion and gated
-restart begins with continuous-DSP recovery.
+state resumes exactly. A capture-target-only migration verifies the prior full
+configuration fingerprint after substituting only the checkpoint target, then
+preserves cadence histories, learned watchdogs, evidence, adaptive state, and
+safety deficits. It clears qualification and promotion deadlines and recomputes
+them under the new target. Any additional policy difference retains eligible
+evidence but forces cadence relearning. Compatible shadow checkpoints may be
+promoted into gated mode without repeating the entire evidence run, but every
+promotion and gated restart begins with continuous-DSP recovery.
 
 The exact Clopper-Pearson bound is cached by each sender's evidence tuple
 (`events`, `misses`, and confidence alpha). Qualification timers and fail-open

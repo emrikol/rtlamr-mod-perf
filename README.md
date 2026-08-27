@@ -36,8 +36,11 @@ optional direct RTL-SDR input path when their runtime gates pass.
   into gated mode while forcing continuous-DSP recovery first. Exact confidence
   results are cached by evidence tuple, and sender configuration is
   canonicalized so estimating-state block processing stays cheap and unchanged
-  policies resume deterministically. Optional site-specific seeds belong in a
-  protected runtime policy file, never in the public binary.
+  policies resume deterministically. A capture-target-only change preserves
+  independently learned cadence, watchdogs, and evidence after proving every
+  other normalized configuration field is identical; qualification and its
+  stability timer always restart under the new target. Optional site-specific
+  seeds belong in a protected runtime policy file, never in the public binary.
 - The bundled collector has an opt-in 60-second change-or-heartbeat policy for
   R900 data. It emits field changes immediately while bounding unchanged
   heartbeat writes.

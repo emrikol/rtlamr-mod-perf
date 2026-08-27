@@ -2,6 +2,7 @@ package dutyscheduler
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -71,6 +72,89 @@ func TestStateRoundTripContinuesExactly(t *testing.T) {
 	right, _ := restored.ExportState()
 	if !reflect.DeepEqual(left, right) {
 		t.Fatal("restored scheduler diverged after identical continuation")
+	}
+}
+
+func TestCaptureTargetRestorePreservesIndependentState(t *testing.T) {
+	originalConfig := testConfig(ModeShadow)
+	original, err := New(originalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := map[uint64]time.Duration{1: 60 * time.Second, 2: 28 * time.Second, 3: 28 * time.Second}
+	period := map[uint64]time.Duration{1: 60 * time.Second, 2: 28 * time.Second, 3: 28 * time.Second}
+	protocol := map[uint64]string{1: "IDM", 2: "R900", 3: "R900"}
+	advanceScheduler(t, original, 0, 2*time.Hour, next, period, protocol)
+	state, err := original.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newConfig := originalConfig
+	newConfig.CaptureTarget = 0.95
+	restored, err := New(newConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.RestoreCaptureTargetState(state, originalConfig.CaptureTarget); err != nil {
+		t.Fatal(err)
+	}
+	after, err := restored.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ConfigSHA256 == state.ConfigSHA256 {
+		t.Fatal("capture-target restore retained the old configuration fingerprint")
+	}
+	if !reflect.DeepEqual(after.Senders, state.Senders) || !reflect.DeepEqual(after.Protocols, state.Protocols) {
+		t.Fatal("capture-target restore changed sender or protocol state")
+	}
+	if after.LastEndNS != state.LastEndNS || after.Started != state.Started || after.RecoveryUntilNS != state.RecoveryUntilNS || after.DeadlineDeficits != state.DeadlineDeficits || after.CountDeficits != state.CountDeficits || after.Discontinuities != state.Discontinuities || after.RefreshUntilNS != state.RefreshUntilNS || after.NextRefreshNS != state.NextRefreshNS || after.Refreshes != state.Refreshes || after.RNG != state.RNG {
+		t.Fatal("capture-target restore changed target-independent controller state")
+	}
+	for idx, got := range after.Candidates {
+		want := state.Candidates[idx]
+		if !reflect.DeepEqual(got.Senders, want.Senders) || got.Name != want.Name || got.LastEligible != want.LastEligible || got.LastAwake != want.LastAwake || got.TotalDurationNS != want.TotalDurationNS || got.TotalAwakeNS != want.TotalAwakeNS || got.EligibleDurationNS != want.EligibleDurationNS || got.AwakeDurationNS != want.AwakeDurationNS || got.Invalid != want.Invalid || got.Epoch != want.Epoch || got.WakeScale != want.WakeScale || got.RecoveryUntilNS != want.RecoveryUntilNS {
+			t.Fatalf("candidate %s lost target-independent state", got.Name)
+		}
+		if got.Qualified || got.PromotionReadyNS != state.LastEndNS+int64(newConfig.PromotionStability) {
+			t.Fatalf("candidate %s did not restart promotion safely: qualified=%t promotion=%d", got.Name, got.Qualified, got.PromotionReadyNS)
+		}
+	}
+	unchanged, err := original.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(state, unchanged) {
+		t.Fatal("capture-target restore mutated the source scheduler")
+	}
+}
+
+func TestCaptureTargetRestoreRejectsAnyAdditionalPolicyChange(t *testing.T) {
+	originalConfig := testConfig(ModeShadow)
+	original, err := New(originalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := original.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changedConfig := originalConfig
+	changedConfig.CaptureTarget = 0.995
+	changedConfig.RefreshInterval = 7 * time.Hour
+	restored, err := New(changedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := restored.ExportState()
+	if err := restored.RestoreCaptureTargetState(state, originalConfig.CaptureTarget); !errors.Is(err, ErrStateConfigurationMismatch) {
+		t.Fatalf("additional policy change error=%v, want configuration mismatch", err)
+	}
+	after, _ := restored.ExportState()
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("failed target-only restore mutated the receiver")
 	}
 }
 
