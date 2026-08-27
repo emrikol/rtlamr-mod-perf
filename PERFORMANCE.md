@@ -75,6 +75,48 @@ a bounded screen measured roughly **31.9% less process CPU** than the earlier
 direct-copy control. More elaborate persistent-DMA and asynchronous pipeline
 variants did not improve the complete boundary and were not retained.
 
+## Modeled energy implications
+
+Reducing CPU time does not reduce total device power by the same percentage.
+The reference end-to-end measurements nevertheless remove approximately one
+continuously busy Cortex-A72 core: the original workflow used about 105% of one
+core, while a bounded post-integration profile used 2.34%. That is a 97.8%
+reduction in decoder-process CPU, equivalent to 25.7% of the four-core Pi 4's
+total CPU capacity. The README uses the more conservative rounded claim of
+roughly 96% because complete-workflow observations vary with RF traffic and
+host activity.
+
+Raspberry Pi's [power documentation](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#power-supply)
+reports approximately 0.6 A average at idle and 1.2 A under stress for a Pi 4,
+or about 3 W of idle-to-stress headroom at 5 V. Raspberry Pi's separate
+[firmware and thermal testing](https://www.raspberrypi.com/news/thermal-testing-raspberry-pi-4/)
+measured 2.36 W at idle and 6.67 W under its worst-case synthetic workload, a
+4.31 W range. Scaling those two published dynamic ranges by the removed 25.7%
+CPU-capacity equivalent gives 0.77 W and 1.11 W respectively. Rounded to avoid
+false precision, the modeled board-level saving is therefore **0.8--1.1 W**.
+
+For a continuously running receiver, that corresponds to approximately:
+
+| Period | Modeled board energy avoided |
+| --- | ---: |
+| Day | 18--27 Wh |
+| 30-day month | 0.55--0.80 kWh |
+| Year | 6.7--9.7 kWh |
+
+For battery systems, runtime scales with the complete system draw, not just the
+decoder. As an illustration, reducing a measured 5 W installation by 0.9 W
+would increase ideal runtime by about 22% (`5 / 4.1 - 1`). For solar sizing,
+18--27 Wh/day is equivalent to roughly 7.5--11.3 W of panel capacity at three
+peak-sun-hours and 80% end-to-end charging efficiency.
+
+This is a capacity model, not a measured wall-power claim. CPU power is not
+perfectly linear, the four cores share voltage and frequency domains, and the
+SDR, USB controller, RAM, networking, storage, collector, and other services
+continue to draw power. Raspberry Pi also notes that its published figures
+exclude additional USB devices. A specific installation needs a counterbalanced
+inline USB-C meter or smart-plug A/B run to establish actual input watts and
+power-supply losses.
+
 ## Adaptive DSP scheduling
 
 The opt-in duty scheduler learns per-sender cadence while SDR ingestion remains
@@ -86,8 +128,8 @@ Modes are:
 - `off`: decode every block, with no scheduler state;
 - `shadow`: learn and score skip decisions while still decoding every block;
 - `gated`: apply qualified skip decisions, periodically audit skipped regions,
-  periodically audit skipped regions, return to continuous DSP for scheduled
-  refresh windows, and fail open on obligation/count/recovery conditions.
+  return to continuous DSP for scheduled refresh windows, and fail open on
+  obligation/count/recovery conditions.
 
 Qualification is per sender. The default capture target is 99.5% at one-sided
 95% confidence, which requires 598 clean eligible observations before a

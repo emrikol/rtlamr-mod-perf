@@ -39,6 +39,12 @@ optional direct RTL-SDR input path when their runtime gates pass.
 - The bundled collector has an opt-in 60-second change-or-heartbeat policy for
   R900 data. It emits field changes immediately while bounding unchanged
   heartbeat writes.
+- Removing roughly one continuously busy Cortex-A72 core from the reference
+  Raspberry Pi 4 workflow corresponds to a modeled **0.8--1.1 W** reduction at
+  the board, or about **18--27 Wh/day** and **7--10 kWh/year**. This is a
+  data-backed capacity estimate, not a wall-power measurement; USB peripherals,
+  storage, RF hardware, power-supply loss, and other services remain. See the
+  [energy model and assumptions](PERFORMANCE.md#modeled-energy-implications).
 
 See [PERFORMANCE.md](PERFORMANCE.md) for architecture, benchmark methodology,
 accepted changes, rejected design families, and attribution. Operational
