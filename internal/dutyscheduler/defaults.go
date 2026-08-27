@@ -7,16 +7,21 @@ import (
 
 func defaultCandidate(name string, history int, r900Floor, otherFloor time.Duration, quantile float64, margin time.Duration) CandidateConfig {
 	return CandidateConfig{
-		Name:            name,
-		HistoryLimit:    history,
-		WarmupIntervals: 4,
-		R900Floor:       r900Floor,
-		OtherFloor:      otherFloor,
-		JitterQuantile:  quantile,
-		JitterMargin:    margin,
-		PreScale:        1,
-		PostScale:       1,
-		AuditFraction:   0.10,
+		Name:             name,
+		HistoryLimit:     history,
+		MinHistoryLimit:  min(8, history),
+		WarmupIntervals:  4,
+		R900Floor:        r900Floor,
+		OtherFloor:       otherFloor,
+		JitterQuantile:   quantile,
+		JitterMargin:     margin,
+		PreScale:         1,
+		PostScale:        1,
+		AuditFraction:    0.10,
+		ChangePointScale: 2,
+		HistoryGrowAfter: 8,
+		WakeScaleStep:    1.25,
+		MaxWakeScale:     4,
 	}
 }
 
@@ -48,13 +53,22 @@ func DefaultConfig(mode Mode, senderIDs []uint64) Config {
 		senders = append(senders, DefaultSenderConfig(id))
 	}
 	return Config{
-		Mode:             mode,
-		Senders:          senders,
-		Candidates:       DefaultCandidates(),
-		CaptureTarget:    0.995,
-		Confidence:       0.95,
-		MinimumAudit:     0.10,
-		RecoveryDuration: 10 * time.Minute,
-		RandomSeed:       0x72746c616d72,
+		Mode:                 mode,
+		Senders:              senders,
+		Candidates:           DefaultCandidates(),
+		CaptureTarget:        0.995,
+		Confidence:           0.95,
+		MinimumAudit:         0.10,
+		RecoveryDuration:     10 * time.Minute,
+		RefreshInterval:      6 * time.Hour,
+		RefreshDuration:      10 * time.Minute,
+		PromotionMargin:      0.00025,
+		PromotionStability:   10 * time.Minute,
+		WatchdogHistory:      128,
+		WatchdogMinIntervals: 16,
+		WatchdogWindow:       10 * time.Minute,
+		WatchdogQuantile:     0.99,
+		WatchdogMargin:       0.25,
+		RandomSeed:           0x72746c616d72,
 	}
 }

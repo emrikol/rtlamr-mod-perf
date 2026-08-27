@@ -24,27 +24,40 @@ type dutyCollarBlock struct {
 }
 
 type dutyRuntime struct {
-	mode            dutyscheduler.Mode
-	scheduler       *dutyscheduler.Scheduler
-	captureTarget   float64
-	confidence      float64
-	minimumAudit    float64
-	senderIDs       map[uint64]bool
-	sampleRate      int64
-	blockSamples    int64
-	blockBytes      int
-	sampleTime      time.Duration
-	sampleRemainder int64
+	mode                 dutyscheduler.Mode
+	scheduler            *dutyscheduler.Scheduler
+	schedulerConfig      dutyscheduler.Config
+	captureTarget        float64
+	confidence           float64
+	minimumAudit         float64
+	recoveryDuration     time.Duration
+	refreshInterval      time.Duration
+	refreshDuration      time.Duration
+	promotionMargin      float64
+	promotionStability   time.Duration
+	watchdogHistory      int
+	watchdogMinIntervals int
+	watchdogWindow       time.Duration
+	watchdogQuantile     float64
+	watchdogMargin       float64
+	senderIDs            map[uint64]bool
+	sampleRate           int64
+	blockSamples         int64
+	blockBytes           int
+	sampleTime           time.Duration
+	sampleRemainder      int64
 
 	collar       []dutyCollarBlock
 	collarCount  int
 	collarNext   int
 	warmupBlocks int
 	wasSkipped   bool
+	skippedRun   int
 
 	decodedBlocks  uint64
 	skippedBlocks  uint64
 	auditedBlocks  uint64
+	refreshBlocks  uint64
 	rebuilds       uint64
 	replayedBlocks uint64
 
@@ -98,32 +111,43 @@ type dutyTrustETA struct {
 }
 
 type dutyRuntimeReport struct {
-	Schema             string                 `json:"schema"`
-	CreatedUTC         string                 `json:"created_utc"`
-	SessionStartedUTC  string                 `json:"session_started_utc"`
-	ReportKind         string                 `json:"report_kind"`
-	CheckpointSequence uint64                 `json:"checkpoint_sequence"`
-	CheckpointFailures uint64                 `json:"checkpoint_failures"`
-	Mode               dutyscheduler.Mode     `json:"mode"`
-	CaptureTarget      float64                `json:"capture_target"`
-	Confidence         float64                `json:"confidence"`
-	MinimumAudit       float64                `json:"minimum_audit"`
-	SenderIDs          []uint64               `json:"sender_ids"`
-	SampleRate         int64                  `json:"sample_rate"`
-	BlockSamples       int64                  `json:"block_samples"`
-	BlockBytes         int                    `json:"block_bytes"`
-	CollarBlocks       int                    `json:"collar_blocks"`
-	WarmupBlocks       int                    `json:"warmup_blocks"`
-	SampleRemainder    int64                  `json:"sample_remainder"`
-	DecodedBlocks      uint64                 `json:"decoded_blocks"`
-	SkippedBlocks      uint64                 `json:"skipped_blocks"`
-	AuditedBlocks      uint64                 `json:"audited_blocks"`
-	Rebuilds           uint64                 `json:"rebuilds"`
-	ReplayedBlocks     uint64                 `json:"replayed_blocks"`
-	TrustETA           dutyTrustETA           `json:"trust_eta"`
-	Snapshot           dutyscheduler.Snapshot `json:"snapshot"`
-	Resume             dutyResumeInfo         `json:"resume"`
-	SchedulerState     dutyscheduler.State    `json:"scheduler_state"`
+	Schema               string                 `json:"schema"`
+	CreatedUTC           string                 `json:"created_utc"`
+	SessionStartedUTC    string                 `json:"session_started_utc"`
+	ReportKind           string                 `json:"report_kind"`
+	CheckpointSequence   uint64                 `json:"checkpoint_sequence"`
+	CheckpointFailures   uint64                 `json:"checkpoint_failures"`
+	Mode                 dutyscheduler.Mode     `json:"mode"`
+	CaptureTarget        float64                `json:"capture_target"`
+	Confidence           float64                `json:"confidence"`
+	MinimumAudit         float64                `json:"minimum_audit"`
+	RecoveryDurationNS   int64                  `json:"recovery_duration_ns"`
+	RefreshIntervalNS    int64                  `json:"refresh_interval_ns"`
+	RefreshDurationNS    int64                  `json:"refresh_duration_ns"`
+	PromotionMargin      float64                `json:"promotion_margin"`
+	PromotionStabilityNS int64                  `json:"promotion_stability_ns"`
+	WatchdogHistory      int                    `json:"watchdog_history"`
+	WatchdogMinIntervals int                    `json:"watchdog_min_intervals"`
+	WatchdogWindowNS     int64                  `json:"watchdog_window_ns"`
+	WatchdogQuantile     float64                `json:"watchdog_quantile"`
+	WatchdogMargin       float64                `json:"watchdog_margin"`
+	SenderIDs            []uint64               `json:"sender_ids"`
+	SampleRate           int64                  `json:"sample_rate"`
+	BlockSamples         int64                  `json:"block_samples"`
+	BlockBytes           int                    `json:"block_bytes"`
+	CollarBlocks         int                    `json:"collar_blocks"`
+	WarmupBlocks         int                    `json:"warmup_blocks"`
+	SampleRemainder      int64                  `json:"sample_remainder"`
+	DecodedBlocks        uint64                 `json:"decoded_blocks"`
+	SkippedBlocks        uint64                 `json:"skipped_blocks"`
+	AuditedBlocks        uint64                 `json:"audited_blocks"`
+	RefreshBlocks        uint64                 `json:"refresh_blocks"`
+	Rebuilds             uint64                 `json:"rebuilds"`
+	ReplayedBlocks       uint64                 `json:"replayed_blocks"`
+	TrustETA             dutyTrustETA           `json:"trust_eta"`
+	Snapshot             dutyscheduler.Snapshot `json:"snapshot"`
+	Resume               dutyResumeInfo         `json:"resume"`
+	SchedulerState       dutyscheduler.State    `json:"scheduler_state"`
 }
 
 func newDutyRuntime(modeText string, cfg protocol.PacketConfig, ids []uint64) (*dutyRuntime, error) {
@@ -137,10 +161,16 @@ func newDutyRuntimeWithCaptureTarget(modeText string, cfg protocol.PacketConfig,
 	}
 	schedulerConfig := dutyscheduler.DefaultConfig(mode, ids)
 	schedulerConfig.CaptureTarget = captureTarget
+	return newDutyRuntimeWithConfig(cfg, ids, schedulerConfig)
+}
+
+func newDutyRuntimeWithConfig(cfg protocol.PacketConfig, ids []uint64, schedulerConfig dutyscheduler.Config) (*dutyRuntime, error) {
+	mode := schedulerConfig.Mode
 	scheduler, err := dutyscheduler.New(schedulerConfig)
 	if err != nil {
 		return nil, err
 	}
+	schedulerConfig = scheduler.Configuration()
 	if cfg.SampleRate <= 0 || cfg.BlockSize <= 0 || cfg.BlockSize2 <= 0 || cfg.BufferLength <= 0 {
 		return nil, fmt.Errorf("dutyscheduler: invalid decoder geometry")
 	}
@@ -150,19 +180,30 @@ func newDutyRuntimeWithCaptureTarget(modeText string, cfg protocol.PacketConfig,
 		collarBlocks = warmupBlocks + 1
 	}
 	runtime := &dutyRuntime{
-		mode:          mode,
-		scheduler:     scheduler,
-		captureTarget: schedulerConfig.CaptureTarget,
-		confidence:    schedulerConfig.Confidence,
-		minimumAudit:  schedulerConfig.MinimumAudit,
-		senderIDs:     make(map[uint64]bool, len(ids)),
-		sampleRate:    int64(cfg.SampleRate),
-		blockSamples:  int64(cfg.BlockSize),
-		blockBytes:    cfg.BlockSize2,
-		collar:        make([]dutyCollarBlock, collarBlocks),
-		warmupBlocks:  warmupBlocks,
-		startedUTC:    time.Now().UTC(),
-		resume:        dutyResumeInfo{Status: "FRESH"},
+		mode:                 mode,
+		scheduler:            scheduler,
+		schedulerConfig:      schedulerConfig,
+		captureTarget:        schedulerConfig.CaptureTarget,
+		confidence:           schedulerConfig.Confidence,
+		minimumAudit:         schedulerConfig.MinimumAudit,
+		recoveryDuration:     schedulerConfig.RecoveryDuration,
+		refreshInterval:      schedulerConfig.RefreshInterval,
+		refreshDuration:      schedulerConfig.RefreshDuration,
+		promotionMargin:      schedulerConfig.PromotionMargin,
+		promotionStability:   schedulerConfig.PromotionStability,
+		watchdogHistory:      schedulerConfig.WatchdogHistory,
+		watchdogMinIntervals: schedulerConfig.WatchdogMinIntervals,
+		watchdogWindow:       schedulerConfig.WatchdogWindow,
+		watchdogQuantile:     schedulerConfig.WatchdogQuantile,
+		watchdogMargin:       schedulerConfig.WatchdogMargin,
+		senderIDs:            make(map[uint64]bool, len(ids)),
+		sampleRate:           int64(cfg.SampleRate),
+		blockSamples:         int64(cfg.BlockSize),
+		blockBytes:           cfg.BlockSize2,
+		collar:               make([]dutyCollarBlock, collarBlocks),
+		warmupBlocks:         warmupBlocks,
+		startedUTC:           time.Now().UTC(),
+		resume:               dutyResumeInfo{Status: "FRESH"},
 	}
 	for idx := range runtime.collar {
 		runtime.collar[idx].data = make([]byte, runtime.blockBytes)
@@ -224,11 +265,16 @@ func (d *dutyRuntime) finishBlock(block []byte, start, end time.Duration, wallTi
 	}
 	if decision.Decode {
 		d.decodedBlocks++
+		d.skippedRun = 0
 	} else {
 		d.skippedBlocks++
+		d.skippedRun++
 	}
 	if decision.Audit {
 		d.auditedBlocks++
+	}
+	if decision.Refresh {
+		d.refreshBlocks++
 	}
 	d.wasSkipped = !decision.Decode
 }
@@ -252,6 +298,12 @@ func (d *dutyRuntime) orderedCollar() []*dutyCollarBlock {
 func (d *dutyRuntime) observe(id uint64, protocolName string, at time.Duration) {
 	if d.senderIDs[id] {
 		d.scheduler.Observe(id, protocolName, at)
+	}
+}
+
+func (d *dutyRuntime) observeEscape(id uint64, protocolName string, at time.Duration) {
+	if d.senderIDs[id] {
+		d.scheduler.ObserveEscape(id, protocolName, at)
 	}
 }
 
@@ -313,10 +365,20 @@ func (d *dutyRuntime) trustETA(snapshot dutyscheduler.Snapshot, now time.Time) d
 				result.EstimatedRemainingSeconds = &zero
 				result.EstimatedReadyUTC = now.UTC().Format(time.RFC3339Nano)
 			}
+		} else if candidate.ContractQualified {
+			candidateETA.Status = "CONTRACT_QUALIFIED"
+			zero := float64(0)
+			candidateETA.EstimatedRemainingSeconds = &zero
+			if result.Status != "QUALIFIED" && result.Status != "CONTRACT_QUALIFIED" {
+				result.Status = "CONTRACT_QUALIFIED"
+				result.Candidate = candidate.Name
+				result.EstimatedRemainingSeconds = &zero
+				result.EstimatedReadyUTC = now.UTC().Format(time.RFC3339Nano)
+			}
 		} else if allRatesKnown && !math.IsInf(candidateSeconds, 0) && !math.IsNaN(candidateSeconds) {
 			candidateETA.Status = "ESTIMATING"
 			candidateETA.EstimatedRemainingSeconds = &candidateSeconds
-			if result.Status != "QUALIFIED" && (!bestSet || candidateSeconds < bestSeconds) {
+			if result.Status != "QUALIFIED" && result.Status != "CONTRACT_QUALIFIED" && (!bestSet || candidateSeconds < bestSeconds) {
 				bestSet = true
 				bestSeconds = candidateSeconds
 				result.Status = "ESTIMATING"
@@ -344,32 +406,43 @@ func (d *dutyRuntime) makeReport(now time.Time, kind string) (dutyRuntimeReport,
 		return dutyRuntimeReport{}, err
 	}
 	return dutyRuntimeReport{
-		Schema:             "rtlamr-duty-scheduler-live-v3",
-		CreatedUTC:         now.UTC().Format(time.RFC3339Nano),
-		SessionStartedUTC:  d.startedUTC.Format(time.RFC3339Nano),
-		ReportKind:         kind,
-		CheckpointSequence: d.checkpointSequence,
-		CheckpointFailures: d.checkpointFailures,
-		Mode:               d.mode,
-		CaptureTarget:      d.captureTarget,
-		Confidence:         d.confidence,
-		MinimumAudit:       d.minimumAudit,
-		SenderIDs:          ids,
-		SampleRate:         d.sampleRate,
-		BlockSamples:       d.blockSamples,
-		BlockBytes:         d.blockBytes,
-		CollarBlocks:       len(d.collar),
-		WarmupBlocks:       d.warmupBlocks,
-		SampleRemainder:    d.sampleRemainder,
-		DecodedBlocks:      d.decodedBlocks,
-		SkippedBlocks:      d.skippedBlocks,
-		AuditedBlocks:      d.auditedBlocks,
-		Rebuilds:           d.rebuilds,
-		ReplayedBlocks:     d.replayedBlocks,
-		TrustETA:           d.trustETA(snapshot, now),
-		Snapshot:           snapshot,
-		Resume:             d.resume,
-		SchedulerState:     state,
+		Schema:               "rtlamr-duty-scheduler-live-v4",
+		CreatedUTC:           now.UTC().Format(time.RFC3339Nano),
+		SessionStartedUTC:    d.startedUTC.Format(time.RFC3339Nano),
+		ReportKind:           kind,
+		CheckpointSequence:   d.checkpointSequence,
+		CheckpointFailures:   d.checkpointFailures,
+		Mode:                 d.mode,
+		CaptureTarget:        d.captureTarget,
+		Confidence:           d.confidence,
+		MinimumAudit:         d.minimumAudit,
+		RecoveryDurationNS:   int64(d.recoveryDuration),
+		RefreshIntervalNS:    int64(d.refreshInterval),
+		RefreshDurationNS:    int64(d.refreshDuration),
+		PromotionMargin:      d.promotionMargin,
+		PromotionStabilityNS: int64(d.promotionStability),
+		WatchdogHistory:      d.watchdogHistory,
+		WatchdogMinIntervals: d.watchdogMinIntervals,
+		WatchdogWindowNS:     int64(d.watchdogWindow),
+		WatchdogQuantile:     d.watchdogQuantile,
+		WatchdogMargin:       d.watchdogMargin,
+		SenderIDs:            ids,
+		SampleRate:           d.sampleRate,
+		BlockSamples:         d.blockSamples,
+		BlockBytes:           d.blockBytes,
+		CollarBlocks:         len(d.collar),
+		WarmupBlocks:         d.warmupBlocks,
+		SampleRemainder:      d.sampleRemainder,
+		DecodedBlocks:        d.decodedBlocks,
+		SkippedBlocks:        d.skippedBlocks,
+		AuditedBlocks:        d.auditedBlocks,
+		RefreshBlocks:        d.refreshBlocks,
+		Rebuilds:             d.rebuilds,
+		ReplayedBlocks:       d.replayedBlocks,
+		TrustETA:             d.trustETA(snapshot, now),
+		Snapshot:             snapshot,
+		Resume:               d.resume,
+		SchedulerState:       state,
 	}, nil
 
 }

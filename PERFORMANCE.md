@@ -86,18 +86,83 @@ Modes are:
 - `off`: decode every block, with no scheduler state;
 - `shadow`: learn and score skip decisions while still decoding every block;
 - `gated`: apply qualified skip decisions, periodically audit skipped regions,
-  and fail open on overdue/count/recovery conditions.
+  periodically audit skipped regions, return to continuous DSP for scheduled
+  refresh windows, and fail open on obligation/count/recovery conditions.
 
 Qualification is per sender. The default capture target is 99.5% at one-sided
 95% confidence, which requires 598 clean eligible observations before a
 zero-miss sender can qualify. The target is adjustable with
 `-dutyschedulercapturetarget`. Checkpoints are atomic and versioned; compatible
 state resumes exactly, while policy changes retain eligible evidence but force
-cadence relearning.
+cadence relearning. Compatible shadow checkpoints may be promoted into gated
+mode without repeating the entire evidence run, but every promotion and gated
+restart begins with continuous-DSP recovery.
 
 Sender-specific watchdog values are operational data. The public default leaves
 static count/deadline thresholds disabled rather than compiling private cadence
-or endpoint identities into the binary.
+or endpoint identities into the binary. A protected JSON file selected with
+`-dutyschedulerpolicy` can supply optional per-sender seeds and controller
+limits. Unknown or duplicate sender IDs, unknown fields, malformed durations,
+symlinks, group/world-accessible policy files, and invalid controller bounds
+fail closed. Policy files must be private regular files (for example, mode
+`0600`).
+
+The generic controller learns a conservative overdue horizon and rolling-count
+floor independently for each sender. Every accepted arrival opens the next
+arrival obligation; an expired obligation, rolling-count deficit, audited
+out-of-window arrival, protocol change, or clock discontinuity immediately
+returns gated mode to continuous DSP. Protocol totals are telemetry only—a
+healthy sender or protocol can never satisfy another sender's gate.
+
+The raw-IQ collar has two wake paths. A complete short sleep still present in
+the collar is replayed through the existing decoder state, preserving the same
+message sequence as continuous DSP. A longer sleep creates a fresh decoder and
+uses the collar as warmup. Any configured-sender message recovered from a
+skipped block is explicitly reported as an escape, even though replay occurs
+after the controller clock has entered an awake block, and therefore triggers
+immediate fail-open recovery.
+
+Cadence fitting retains up to 128 intervals while adapting its effective
+history through 8, 16, 32, 64, and 128 observations. A residual change point
+falls back to recent history, widens the wake envelope, raises the audit rate,
+shortens the next refresh interval, and starts a fresh confidence epoch. A
+candidate can rehabilitate after recovery and fresh evidence. Clean full-DSP
+refreshes cautiously tighten a previously widened envelope, again requiring a
+fresh evidence epoch before suppression resumes.
+
+Default gated safeguards are:
+
+- at least 10% randomized whole-quiet-interval audits;
+- ten minutes of continuous-DSP recovery;
+- ten minutes of continuous DSP every six hours;
+- a stricter promotion bound plus a ten-minute stability period, with immediate
+  demotion at the configured capture contract; and
+- learned watchdogs after 16 intervals, using up to 128 recent gaps.
+
+All defaults are generic and configurable through the protected policy file.
+The capture contract, continuous SDR ingestion, owned raw-IQ collar, and
+fail-open direction are invariant.
+
+Example policy using a synthetic sender ID:
+
+```json
+{
+  "schema": "rtlamr-duty-scheduler-policy-v1",
+  "refresh_interval": "6h",
+  "refresh_duration": "10m",
+  "senders": [
+    {
+      "id": 12345678,
+      "overdue": "5m",
+      "count_window": "10m",
+      "minimum_count": 2
+    }
+  ]
+}
+```
+
+The scheduler remains opt-in. Qualification is evidence for a reversible gated
+trial, not a claim that every RF environment is stationary or lossless.
 
 ## Collector write coalescing
 

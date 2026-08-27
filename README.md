@@ -26,12 +26,16 @@ optional direct RTL-SDR input path when their runtime gates pass.
   control; more elaborate asynchronous and persistent-DMA variants lost and
   were rejected.
 - An opt-in self-learning DSP duty scheduler provides safe-seed, shadow,
-  gated, audit, and fail-open recovery modes. It will not skip DSP until every
-  configured sender independently clears the selected capture target at
-  one-sided 95% confidence. The default target is **99.5%** (598 clean
-  observations per sender); stricter targets remain configurable. Versioned
-  checkpoints resume compatible learning without embedding sender-specific
-  cadence or endpoint identities in the binary.
+  gated, audit, periodic full-refresh, and fail-open recovery behavior. It will
+  not skip DSP until every configured sender independently clears the selected
+  capture target at one-sided 95% confidence and passes promotion hysteresis.
+  The default target is **99.5%** (598 clean observations per sender); stricter
+  targets remain configurable. Learned watchdogs, per-arrival obligations,
+  adaptive history, and recoverable evidence epochs track drift after initial
+  qualification. Versioned checkpoints can promote compatible shadow evidence
+  into gated mode while forcing continuous-DSP recovery first. Optional
+  site-specific seeds belong in a protected runtime policy file, never in the
+  public binary.
 - The bundled collector has an opt-in 60-second change-or-heartbeat policy for
   R900 data. It emits field changes immediately while bounding unchanged
   heartbeat writes.

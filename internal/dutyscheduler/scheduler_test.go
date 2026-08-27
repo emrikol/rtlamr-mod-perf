@@ -34,11 +34,13 @@ func testConfig(mode Mode) Config {
 			testCandidate("n16", 16, 500*time.Millisecond, 5*time.Second),
 			testCandidate("n64", 64, 500*time.Millisecond, 5*time.Second),
 		},
-		CaptureTarget:    0.999,
-		Confidence:       0.95,
-		MinimumAudit:     0.10,
-		RecoveryDuration: 10 * time.Minute,
-		RandomSeed:       1,
+		CaptureTarget:      0.999,
+		Confidence:         0.95,
+		MinimumAudit:       0.10,
+		RecoveryDuration:   10 * time.Minute,
+		PromotionMargin:    0.000000001,
+		PromotionStability: time.Nanosecond,
+		RandomSeed:         1,
 	}
 }
 
@@ -217,7 +219,7 @@ func TestDeadlineDeficitForcesRecovery(t *testing.T) {
 			sender.events = 2995
 		}
 	}
-	scheduler.refreshQualifications()
+	scheduler.refreshQualifications(scheduler.lastEnd)
 	scheduler.Observe(1, "IDM", time.Second)
 	scheduler.Observe(2, "R900", time.Second)
 	scheduler.Observe(3, "R900", time.Second)
@@ -294,7 +296,7 @@ func TestAuditDecisionIsStableForWholeQuietInterval(t *testing.T) {
 			sender.events = 2995
 		}
 	}
-	scheduler.refreshQualifications()
+	scheduler.refreshQualifications(scheduler.lastEnd)
 	scheduler.Advance(0, time.Second)
 	firstQuiet := scheduler.Advance(time.Second, 2*time.Second)
 	for second := 2; second < 27; second++ {
@@ -319,6 +321,288 @@ func TestInvalidConfigurationFailsClosed(t *testing.T) {
 	cfg.Senders = append(cfg.Senders, cfg.Senders[0])
 	if _, err := New(cfg); err == nil {
 		t.Fatal("duplicate sender was accepted")
+	}
+	cfg = testConfig(ModeGated)
+	cfg.WatchdogQuantile = math.NaN()
+	if _, err := New(cfg); err == nil {
+		t.Fatal("non-finite controller configuration was accepted")
+	}
+}
+
+func primeCandidateForControllerTest(t *testing.T, scheduler *Scheduler, candidate *candidate, now time.Duration) {
+	t.Helper()
+	candidate.eligibleDuration = time.Hour
+	candidate.awakeDuration = 10 * time.Minute
+	candidate.totalDuration = time.Hour
+	candidate.totalAwake = 10 * time.Minute
+	required := RequiredObservations(0, scheduler.cfg.CaptureTarget+scheduler.cfg.PromotionMargin, scheduler.cfg.Confidence)
+	for _, sender := range candidate.senders {
+		sender.learned = true
+		sender.seen = true
+		sender.protocol = "R900"
+		sender.period = time.Minute
+		sender.anchor = 0
+		sender.preWake = time.Second
+		sender.postWake = time.Second
+		sender.events = required
+	}
+	scheduler.refreshQualifications(now)
+	scheduler.refreshQualifications(now + scheduler.cfg.PromotionStability)
+	if !candidate.qualified {
+		t.Fatal("candidate did not pass promotion hysteresis")
+	}
+}
+
+func TestPeriodicRefreshForcesContinuousDSP(t *testing.T) {
+	cfg := testConfig(ModeGated)
+	cfg.RefreshInterval = time.Hour
+	cfg.RefreshDuration = 10 * time.Minute
+	scheduler, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := 20 * time.Minute
+	primeCandidateForControllerTest(t, scheduler, scheduler.candidates[0], now)
+	scheduler.started = true
+	scheduler.lastEnd = now + scheduler.cfg.PromotionStability
+	scheduler.chooseCandidate()
+	if scheduler.selected == nil {
+		t.Fatal("qualified candidate was not selected")
+	}
+	scheduler.nextRefresh = scheduler.lastEnd + time.Second
+	decision := scheduler.Advance(scheduler.lastEnd, scheduler.lastEnd+time.Second)
+	if !decision.Decode || !decision.Refresh || decision.Audit {
+		t.Fatalf("refresh did not force continuous DSP: %+v", decision)
+	}
+	if scheduler.Snapshot().Refreshes != 1 {
+		t.Fatal("refresh was not recorded")
+	}
+}
+
+func TestCleanRefreshTightensRecoveredEnvelopeAndStartsFreshEpoch(t *testing.T) {
+	scheduler, err := New(testConfig(ModeGated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := scheduler.candidates[0]
+	primeCandidateForControllerTest(t, scheduler, candidate, 20*time.Minute)
+	candidate.wakeScale = candidate.cfg.WakeScaleStep
+	for _, sender := range candidate.senders {
+		sender.preWake = scaleDuration(sender.preWake, candidate.wakeScale)
+		sender.postWake = scaleDuration(sender.postWake, candidate.wakeScale)
+	}
+	beforeEpoch := candidate.epoch
+	beforeWidth := candidate.senders[1].preWake
+	candidate.tightenAfterRefresh(30 * time.Minute)
+	if candidate.wakeScale != 1 || candidate.epoch != beforeEpoch+1 || candidate.qualified {
+		t.Fatalf("clean refresh did not tighten into a fresh epoch: scale=%f epoch=%d qualified=%v", candidate.wakeScale, candidate.epoch, candidate.qualified)
+	}
+	if candidate.senders[1].preWake >= beforeWidth {
+		t.Fatalf("clean refresh did not narrow the wake envelope: before=%s after=%s", beforeWidth, candidate.senders[1].preWake)
+	}
+	for _, sender := range candidate.senders {
+		if sender.events != 0 || sender.misses != 0 {
+			t.Fatal("clean refresh retained confidence evidence for a tightened envelope")
+		}
+	}
+}
+
+func TestLearnedWatchdogCreatesAndExpiresObligations(t *testing.T) {
+	cfg := DefaultConfig(ModeShadow, []uint64{1})
+	cfg.WatchdogHistory = 8
+	cfg.WatchdogMinIntervals = 4
+	cfg.WatchdogWindow = 10 * time.Minute
+	scheduler, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for minute := 0; minute <= 5; minute++ {
+		at := time.Duration(minute)*time.Minute + time.Second
+		start := scheduler.lastEnd
+		if at > start {
+			scheduler.Advance(start, at)
+		}
+		scheduler.Observe(1, "R900", at)
+	}
+	sender := scheduler.senders[1]
+	if !sender.watchdogLearned || !sender.obligationOpen || sender.learnedOverdue <= time.Minute {
+		t.Fatalf("learned watchdog was not armed: %+v", sender)
+	}
+	scheduler.Advance(scheduler.lastEnd, sender.obligationDue+time.Nanosecond)
+	snapshot := scheduler.Snapshot()
+	observed := snapshot.ObservedSenders[1]
+	if observed.ObligationDeficits != 1 || observed.ObligationsOpened == 0 || snapshot.Protocols["R900"].ObligationDeficits != 1 {
+		t.Fatalf("expired obligation was not recorded per sender and protocol: %+v %+v", observed, snapshot.Protocols)
+	}
+}
+
+func TestProtocolTotalsCannotMaskSenderObligation(t *testing.T) {
+	cfg := DefaultConfig(ModeShadow, []uint64{1, 2})
+	cfg.WatchdogHistory = 8
+	cfg.WatchdogMinIntervals = 2
+	scheduler, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for minute := 0; minute < 3; minute++ {
+		at := time.Duration(minute)*time.Minute + time.Second
+		scheduler.Advance(scheduler.lastEnd, at)
+		scheduler.Observe(1, "R900", at)
+		scheduler.Observe(2, "R900", at)
+	}
+	senderOneDue := scheduler.senders[1].obligationDue
+	senderTwoArrival := 3*time.Minute + time.Second
+	scheduler.Advance(scheduler.lastEnd, senderTwoArrival)
+	scheduler.Observe(2, "R900", senderTwoArrival)
+	scheduler.Advance(scheduler.lastEnd, senderOneDue+time.Nanosecond)
+	snapshot := scheduler.Snapshot()
+	if snapshot.ObservedSenders[1].ObligationDeficits != 1 || snapshot.ObservedSenders[2].ObligationDeficits != 0 {
+		t.Fatalf("sender obligation accounting was masked: %+v", snapshot.ObservedSenders)
+	}
+	if snapshot.Protocols["R900"].ObligationDeficits != 1 {
+		t.Fatalf("protocol telemetry did not aggregate the independent sender deficit: %+v", snapshot.Protocols["R900"])
+	}
+}
+
+func TestAdaptiveHistoryFallsBackOnChangePoint(t *testing.T) {
+	cfg := normalizeConfig(testConfig(ModeShadow)).Candidates[1]
+	model := &senderModel{}
+	for index := 0; index < 24; index++ {
+		if model.observe("R900", time.Duration(index+1)*time.Minute, cfg, 1) {
+			t.Fatalf("stable cadence reported a change at index %d", index)
+		}
+	}
+	before := model.effectiveHistory
+	if before < 16 {
+		t.Fatalf("history never grew: %d", before)
+	}
+	if !model.observe("R900", 26*time.Minute+20*time.Second, cfg, 1) {
+		t.Fatal("large residual did not trigger a change point")
+	}
+	if model.effectiveHistory > cfg.MinHistoryLimit || model.changePoints != 1 {
+		t.Fatalf("change point did not shorten history: history=%d changes=%d", model.effectiveHistory, model.changePoints)
+	}
+}
+
+func TestRecoveryStartsFreshEpochAndCandidateRehabilitates(t *testing.T) {
+	cfg := testConfig(ModeGated)
+	scheduler, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := scheduler.candidates[0]
+	now := 20 * time.Minute
+	primeCandidateForControllerTest(t, scheduler, candidate, now)
+	oldEpoch := candidate.epoch
+	scheduler.recoverAtLeast(candidate.steadySleep(), now)
+	if !candidate.invalid || candidate.epoch != oldEpoch+1 || candidate.wakeScale <= 1 {
+		t.Fatalf("recovery did not widen and start an epoch: %+v", candidate)
+	}
+	for _, sender := range candidate.senders {
+		if sender.events != 0 || sender.misses != 0 {
+			t.Fatal("recovery retained stale confidence evidence")
+		}
+		sender.events = RequiredObservations(0, scheduler.cfg.CaptureTarget+scheduler.cfg.PromotionMargin, scheduler.cfg.Confidence)
+	}
+	ready := now + scheduler.cfg.RecoveryDuration
+	scheduler.refreshQualifications(ready)
+	if candidate.qualified {
+		t.Fatal("candidate skipped promotion stability")
+	}
+	scheduler.refreshQualifications(ready + scheduler.cfg.PromotionStability)
+	if !candidate.qualified || candidate.invalid {
+		t.Fatal("candidate did not rehabilitate from fresh evidence")
+	}
+	for _, sender := range candidate.senders {
+		sender.misses = sender.events
+		break
+	}
+	scheduler.refreshQualifications(ready + scheduler.cfg.PromotionStability + time.Second)
+	if candidate.qualified {
+		t.Fatal("demotion was not immediate")
+	}
+}
+
+func TestRecoveredSkippedArrivalForcesRecoveryAfterClockAdvanced(t *testing.T) {
+	scheduler, err := New(testConfig(ModeGated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := 20 * time.Minute
+	for _, candidate := range scheduler.candidates {
+		primeCandidateForControllerTest(t, scheduler, candidate, now)
+	}
+	for _, sender := range scheduler.senders {
+		sender.protocol = "R900"
+		sender.seen = true
+		sender.lastSeen = now - time.Minute
+	}
+	scheduler.started = true
+	scheduler.lastEnd = now
+	scheduler.chooseCandidate()
+	if scheduler.selected == nil {
+		t.Fatal("qualified candidate was not selected")
+	}
+	oldEpoch := scheduler.selected.epoch
+	scheduler.ObserveEscape(1, "R900", now-time.Second)
+	if scheduler.Snapshot().State != "RECOVERY" || scheduler.selected != nil {
+		t.Fatalf("recovered skipped arrival did not fail open: %+v", scheduler.Snapshot())
+	}
+	if scheduler.candidates[0].epoch <= oldEpoch || scheduler.candidates[0].wakeScale <= 1 {
+		t.Fatal("recovered skipped arrival did not widen into fresh evidence")
+	}
+}
+
+func TestRecoveryFeedbackRemainsBounded(t *testing.T) {
+	scheduler, err := New(testConfig(ModeGated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := scheduler.candidates[0]
+	for iteration := 0; iteration < 100; iteration++ {
+		candidate.beginNewEpoch(time.Duration(iteration)*time.Minute, true)
+	}
+	if candidate.wakeScale != candidate.cfg.MaxWakeScale {
+		t.Fatalf("wake scale=%f want cap=%f", candidate.wakeScale, candidate.cfg.MaxWakeScale)
+	}
+	if audit := candidate.auditFraction(); audit < scheduler.cfg.MinimumAudit || audit > 1 {
+		t.Fatalf("bounded audit fraction=%f", audit)
+	}
+	if refresh := candidate.refreshInterval(scheduler.cfg.RefreshInterval); refresh < time.Minute || refresh > scheduler.cfg.RefreshInterval {
+		t.Fatalf("bounded refresh interval=%s", refresh)
+	}
+}
+
+func TestShadowStatePromotesToGatedWithFailOpenRecovery(t *testing.T) {
+	shadowConfig := testConfig(ModeShadow)
+	shadow, err := New(shadowConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow.Advance(0, time.Second)
+	for id := uint64(1); id <= 3; id++ {
+		shadow.Observe(id, "R900", time.Second)
+	}
+	state, err := shadow.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatedConfig := shadowConfig
+	gatedConfig.Mode = ModeGated
+	gated, err := New(gatedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gated.RestoreShadowState(state); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := gated.Snapshot()
+	if snapshot.Mode != ModeGated || snapshot.State != "RECOVERY" || snapshot.ObservedSenders[1].Observations != 1 {
+		t.Fatalf("shadow promotion was not exact and fail-open: %+v", snapshot)
+	}
+	decision := gated.Advance(time.Second, 2*time.Second)
+	if !decision.Decode || decision.State != "RECOVERY" {
+		t.Fatalf("promoted scheduler suppressed DSP during recovery: %+v", decision)
 	}
 }
 

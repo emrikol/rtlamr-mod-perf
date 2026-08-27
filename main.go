@@ -36,6 +36,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/bemasher/rtlamr/internal/dutyscheduler"
 	"github.com/bemasher/rtlamr/protocol"
 	"github.com/bemasher/rtlamr/r900"
 	"github.com/bemasher/rtltcp"
@@ -282,7 +283,12 @@ func (rcvr *Receiver) NewReceiver() {
 		for id := range meterID.UintMap {
 			ids = append(ids, uint64(id))
 		}
-		rcvr.duty, rcvr.err = newDutyRuntimeWithCaptureTarget(*dutySchedulerMode, rcvr.d.Cfg, ids, *dutySchedulerCaptureTarget/100)
+		schedulerConfig, configErr := loadDutySchedulerConfig(dutyscheduler.Mode(*dutySchedulerMode), ids, *dutySchedulerCaptureTarget/100, *dutySchedulerPolicy)
+		if configErr != nil {
+			slog.Error("load DSP duty scheduler policy", "error", configErr)
+			os.Exit(1)
+		}
+		rcvr.duty, rcvr.err = newDutyRuntimeWithConfig(rcvr.d.Cfg, ids, schedulerConfig)
 		if rcvr.err != nil {
 			slog.Error("configure DSP duty scheduler", "error", rcvr.err)
 			os.Exit(1)
@@ -462,7 +468,7 @@ func (rcvr *Receiver) processBlock(state *receiverRunState, block []byte) bool {
 	if rcvr.duty == nil {
 		messages := rcvr.d.Decode(block)
 		var keepRunning bool
-		pktFound, keepRunning = rcvr.processDecodedMessages(state, messages, 0, time.Time{}, true, false)
+		pktFound, keepRunning = rcvr.processDecodedMessages(state, messages, 0, time.Time{}, true, false, false)
 		if !keepRunning {
 			return false
 		}
@@ -477,13 +483,11 @@ func (rcvr *Receiver) processBlock(state *receiverRunState, block []byte) bool {
 		}
 		if decision.Decode {
 			messages := rcvr.d.Decode(block)
-			currentFound, keepRunning := rcvr.processDecodedMessages(state, messages, end, time.Time{}, true, true)
+			currentFound, keepRunning := rcvr.processDecodedMessages(state, messages, end, time.Time{}, true, true, false)
 			pktFound = pktFound || currentFound
 			if !keepRunning {
 				return false
 			}
-		} else {
-			_, _ = rcvr.processDecodedMessages(state, nil, end, time.Time{}, false, false)
 		}
 		rcvr.duty.finishBlock(block, start, end, time.Now(), decision)
 		if err := rcvr.duty.maybeCheckpoint(time.Now()); err != nil {
@@ -512,7 +516,7 @@ func clearDigestMap(values map[protocol.Digest]bool) {
 	}
 }
 
-func (rcvr *Receiver) processDecodedMessages(state *receiverRunState, messages []protocol.Message, sampleAt time.Duration, eventTime time.Time, publish, observe bool) (bool, bool) {
+func (rcvr *Receiver) processDecodedMessages(state *receiverRunState, messages []protocol.Message, sampleAt time.Duration, eventTime time.Time, publish, observe, escaped bool) (bool, bool) {
 	clearDigestMap(state.next)
 	if rcvr.duty != nil {
 		clearDigestMap(state.dutyNext)
@@ -521,7 +525,11 @@ func (rcvr *Receiver) processDecodedMessages(state *receiverRunState, messages [
 				digest := protocol.NewDigest(msg)
 				state.dutyNext[digest] = true
 				if !state.dutyPrev[digest] {
-					rcvr.duty.observe(uint64(msg.MeterID()), msg.MsgType(), sampleAt)
+					if escaped {
+						rcvr.duty.observeEscape(uint64(msg.MeterID()), msg.MsgType(), sampleAt)
+					} else {
+						rcvr.duty.observe(uint64(msg.MeterID()), msg.MsgType(), sampleAt)
+					}
 				}
 			}
 		}
@@ -587,6 +595,31 @@ func (rcvr *Receiver) processDecodedMessages(state *receiverRunState, messages [
 }
 
 func (rcvr *Receiver) rebuildDutyDecoder(state *receiverRunState) (bool, bool) {
+	entries := rcvr.duty.orderedCollar()
+	if skipped := rcvr.duty.skippedRun; skipped > 0 && skipped <= len(entries) {
+		start := len(entries) - skipped
+		complete := true
+		for _, entry := range entries[start:] {
+			if entry.decoded {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			pktFound := false
+			for _, entry := range entries[start:] {
+				messages := rcvr.d.Decode(entry.data)
+				found, keepRunning := rcvr.processDecodedMessages(state, messages, entry.sampleEnd, entry.wallTime, true, true, true)
+				pktFound = pktFound || found
+				if !keepRunning {
+					return pktFound, false
+				}
+			}
+			rcvr.duty.recordRebuild(skipped)
+			return pktFound, true
+		}
+	}
+
 	oldCfg := rcvr.d.Cfg
 	fresh, err := rcvr.newProtocolDecoder()
 	if err != nil {
@@ -606,11 +639,10 @@ func (rcvr *Receiver) rebuildDutyDecoder(state *receiverRunState) (bool, bool) {
 	clearDigestMap(state.dutyPrev)
 	clearDigestMap(state.dutyNext)
 	pktFound := false
-	entries := rcvr.duty.orderedCollar()
 	for idx, entry := range entries {
 		messages := rcvr.d.Decode(entry.data)
 		publish := !entry.decoded && idx >= rcvr.duty.warmupBlocks
-		found, keepRunning := rcvr.processDecodedMessages(state, messages, entry.sampleEnd, entry.wallTime, publish, publish)
+		found, keepRunning := rcvr.processDecodedMessages(state, messages, entry.sampleEnd, entry.wallTime, publish, publish, publish)
 		pktFound = pktFound || found
 		if !keepRunning {
 			return pktFound, false

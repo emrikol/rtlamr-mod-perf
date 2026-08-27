@@ -74,6 +74,7 @@ var (
 	dutySchedulerCaptureTarget = flag.Float64("dutyschedulercapturetarget", 99.5, "per-sender scheduler capture target percentage (greater than 0 and less than 100)")
 	dutySchedulerReport        = flag.String("dutyschedulerreport", "", "write the final DSP duty scheduler report as JSON")
 	dutySchedulerCheckpointDir = flag.String("dutyschedulercheckpointdir", "", "resume the strongest compatible checkpoint, then write hourly atomic DSP duty scheduler state in this existing directory")
+	dutySchedulerPolicy        = flag.String("dutyschedulerpolicy", "", "optional protected JSON policy file for DSP duty scheduler controller and per-sender watchdog seeds")
 )
 
 func RegisterFlags() {
@@ -104,6 +105,7 @@ func RegisterFlags() {
 		"dutyschedulercapturetarget": true,
 		"dutyschedulerreport":        true,
 		"dutyschedulercheckpointdir": true,
+		"dutyschedulerpolicy":        true,
 		"version":                    true,
 		"source":                     true,
 		"device":                     true,
@@ -187,7 +189,7 @@ func HandleFlags() {
 	*dutySchedulerMode = strings.ToLower(*dutySchedulerMode)
 	switch *dutySchedulerMode {
 	case "off":
-		if *dutySchedulerReport != "" || *dutySchedulerCheckpointDir != "" {
+		if *dutySchedulerReport != "" || *dutySchedulerCheckpointDir != "" || *dutySchedulerPolicy != "" {
 			log.Fatal("dutyscheduler report and checkpoint directory require dutyscheduler=shadow or gated")
 		}
 	case "shadow", "gated":

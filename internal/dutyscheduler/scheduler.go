@@ -28,32 +28,47 @@ type SenderConfig struct {
 }
 
 type CandidateConfig struct {
-	Name            string
-	HistoryLimit    int
-	WarmupIntervals int
-	R900Floor       time.Duration
-	OtherFloor      time.Duration
-	JitterQuantile  float64
-	JitterMargin    time.Duration
-	PreScale        float64
-	PostScale       float64
-	AuditFraction   float64
+	Name             string
+	HistoryLimit     int
+	MinHistoryLimit  int
+	WarmupIntervals  int
+	R900Floor        time.Duration
+	OtherFloor       time.Duration
+	JitterQuantile   float64
+	JitterMargin     time.Duration
+	PreScale         float64
+	PostScale        float64
+	AuditFraction    float64
+	ChangePointScale float64
+	HistoryGrowAfter int
+	WakeScaleStep    float64
+	MaxWakeScale     float64
 }
 
 type Config struct {
-	Mode             Mode
-	Senders          []SenderConfig
-	Candidates       []CandidateConfig
-	CaptureTarget    float64
-	Confidence       float64
-	MinimumAudit     float64
-	RecoveryDuration time.Duration
-	RandomSeed       uint64
+	Mode                 Mode
+	Senders              []SenderConfig
+	Candidates           []CandidateConfig
+	CaptureTarget        float64
+	Confidence           float64
+	MinimumAudit         float64
+	RecoveryDuration     time.Duration
+	RefreshInterval      time.Duration
+	RefreshDuration      time.Duration
+	PromotionMargin      float64
+	PromotionStability   time.Duration
+	WatchdogHistory      int
+	WatchdogMinIntervals int
+	WatchdogWindow       time.Duration
+	WatchdogQuantile     float64
+	WatchdogMargin       float64
+	RandomSeed           uint64
 }
 
 type Decision struct {
 	Decode   bool
 	Audit    bool
+	Refresh  bool
 	Selected string
 	State    string
 }
@@ -68,6 +83,8 @@ type SenderSnapshot struct {
 	PeriodNS                int64   `json:"period_ns"`
 	PreWakeNS               int64   `json:"pre_wake_ns"`
 	PostWakeNS              int64   `json:"post_wake_ns"`
+	EffectiveHistory        int     `json:"effective_history"`
+	ChangePoints            uint64  `json:"change_points"`
 }
 
 type CandidateSnapshot struct {
@@ -75,7 +92,13 @@ type CandidateSnapshot struct {
 	HistoryLimit           int                       `json:"history_limit"`
 	Eligible               bool                      `json:"eligible"`
 	Qualified              bool                      `json:"qualified"`
+	ContractQualified      bool                      `json:"contract_qualified"`
 	Invalid                bool                      `json:"invalid"`
+	Epoch                  uint64                    `json:"epoch"`
+	WakeScale              float64                   `json:"wake_scale"`
+	AuditFraction          float64                   `json:"audit_fraction"`
+	PromotionReadyNS       int64                     `json:"promotion_ready_ns,omitempty"`
+	RecoveryUntilNS        int64                     `json:"recovery_until_ns,omitempty"`
 	ProjectedSleepFraction float64                   `json:"projected_sleep_fraction"`
 	SteadySleepFraction    float64                   `json:"steady_sleep_fraction"`
 	EffectiveSleepFraction float64                   `json:"effective_sleep_fraction"`
@@ -87,13 +110,27 @@ type CandidateSnapshot struct {
 }
 
 type ObservedSenderSnapshot struct {
-	Protocol         string `json:"protocol"`
-	Observations     uint64 `json:"observations"`
-	LastSeenNS       int64  `json:"last_seen_ns"`
-	DeadlineDeficits uint64 `json:"deadline_deficits"`
-	CountDeficits    uint64 `json:"count_deficits"`
-	OverdueOpen      bool   `json:"overdue_open"`
-	CountOpen        bool   `json:"count_open"`
+	Protocol            string `json:"protocol"`
+	Observations        uint64 `json:"observations"`
+	LastSeenNS          int64  `json:"last_seen_ns"`
+	DeadlineDeficits    uint64 `json:"deadline_deficits"`
+	CountDeficits       uint64 `json:"count_deficits"`
+	OverdueOpen         bool   `json:"overdue_open"`
+	CountOpen           bool   `json:"count_open"`
+	WatchdogLearned     bool   `json:"watchdog_learned"`
+	LearnedOverdueNS    int64  `json:"learned_overdue_ns,omitempty"`
+	LearnedMinimumCount int    `json:"learned_minimum_count,omitempty"`
+	ObligationDueNS     int64  `json:"obligation_due_ns,omitempty"`
+	ObligationsOpened   uint64 `json:"obligations_opened"`
+	ObligationsClosed   uint64 `json:"obligations_closed"`
+	ObligationDeficits  uint64 `json:"obligation_deficits"`
+}
+
+type ProtocolSnapshot struct {
+	Observations       uint64 `json:"observations"`
+	DeadlineDeficits   uint64 `json:"deadline_deficits"`
+	CountDeficits      uint64 `json:"count_deficits"`
+	ObligationDeficits uint64 `json:"obligation_deficits"`
 }
 
 type Snapshot struct {
@@ -105,22 +142,29 @@ type Snapshot struct {
 	DeadlineDeficits uint64                            `json:"deadline_deficits"`
 	CountDeficits    uint64                            `json:"count_deficits"`
 	Discontinuities  uint64                            `json:"discontinuities"`
+	Refreshes        uint64                            `json:"refreshes"`
+	RefreshUntilNS   int64                             `json:"refresh_until_ns,omitempty"`
+	NextRefreshNS    int64                             `json:"next_refresh_ns,omitempty"`
 	ObservedSenders  map[uint64]ObservedSenderSnapshot `json:"observed_senders"`
+	Protocols        map[string]ProtocolSnapshot       `json:"protocols"`
 	Candidates       []CandidateSnapshot               `json:"candidates"`
 }
 
 type senderModel struct {
-	protocol string
-	history  []time.Duration
-	last     time.Duration
-	seen     bool
-	learned  bool
-	period   time.Duration
-	anchor   time.Duration
-	preWake  time.Duration
-	postWake time.Duration
-	events   uint64
-	misses   uint64
+	protocol         string
+	history          []time.Duration
+	last             time.Duration
+	seen             bool
+	learned          bool
+	period           time.Duration
+	anchor           time.Duration
+	preWake          time.Duration
+	postWake         time.Duration
+	events           uint64
+	misses           uint64
+	effectiveHistory int
+	stableIntervals  int
+	changePoints     uint64
 }
 
 type candidate struct {
@@ -134,19 +178,39 @@ type candidate struct {
 	awakeDuration    time.Duration
 	invalid          bool
 	qualified        bool
+	epoch            uint64
+	wakeScale        float64
+	promotionReady   time.Duration
+	recoveryUntil    time.Duration
 }
 
 type senderRuntime struct {
-	cfg              SenderConfig
-	protocol         string
-	lastSeen         time.Duration
-	seen             bool
-	observations     []time.Duration
-	total            uint64
-	overdueOpen      bool
-	countOpen        bool
-	deadlineDeficits uint64
-	countDeficits    uint64
+	cfg                 SenderConfig
+	protocol            string
+	lastSeen            time.Duration
+	seen                bool
+	observations        []time.Duration
+	total               uint64
+	overdueOpen         bool
+	countOpen           bool
+	deadlineDeficits    uint64
+	countDeficits       uint64
+	gaps                []time.Duration
+	learnedOverdue      time.Duration
+	learnedMinimumCount int
+	watchdogLearned     bool
+	obligationDue       time.Duration
+	obligationOpen      bool
+	obligationsOpened   uint64
+	obligationsClosed   uint64
+	obligationDeficits  uint64
+}
+
+type protocolRuntime struct {
+	observations       uint64
+	deadlineDeficits   uint64
+	countDeficits      uint64
+	obligationDeficits uint64
 }
 
 type Scheduler struct {
@@ -165,20 +229,34 @@ type Scheduler struct {
 	quietActive      bool
 	auditActive      bool
 	quietCandidate   string
+	refreshUntil     time.Duration
+	nextRefresh      time.Duration
+	refreshes        uint64
+	protocols        map[string]*protocolRuntime
 }
 
 func New(cfg Config) (*Scheduler, error) {
+	cfg = normalizeConfig(cfg)
 	if cfg.Mode != ModeOff && cfg.Mode != ModeShadow && cfg.Mode != ModeGated {
 		return nil, errors.New("dutyscheduler: invalid mode")
 	}
-	if cfg.CaptureTarget <= 0 || cfg.CaptureTarget >= 1 {
+	if !finite(cfg.CaptureTarget) || cfg.CaptureTarget <= 0 || cfg.CaptureTarget >= 1 {
 		return nil, errors.New("dutyscheduler: capture target must be between zero and one")
 	}
-	if cfg.Confidence <= 0 || cfg.Confidence >= 1 {
+	if !finite(cfg.Confidence) || cfg.Confidence <= 0 || cfg.Confidence >= 1 {
 		return nil, errors.New("dutyscheduler: confidence must be between zero and one")
 	}
-	if cfg.MinimumAudit < 0 || cfg.MinimumAudit > 1 {
+	if !finite(cfg.MinimumAudit) || cfg.MinimumAudit < 0 || cfg.MinimumAudit > 1 {
 		return nil, errors.New("dutyscheduler: minimum audit must be between zero and one")
+	}
+	if cfg.RefreshInterval <= 0 || cfg.RefreshDuration <= 0 || cfg.RefreshDuration >= cfg.RefreshInterval {
+		return nil, errors.New("dutyscheduler: invalid refresh policy")
+	}
+	if !finite(cfg.PromotionMargin) || cfg.PromotionMargin < 0 || cfg.CaptureTarget+cfg.PromotionMargin >= 1 || cfg.PromotionStability < 0 {
+		return nil, errors.New("dutyscheduler: invalid promotion policy")
+	}
+	if cfg.WatchdogHistory < 2 || cfg.WatchdogMinIntervals < 2 || cfg.WatchdogMinIntervals > cfg.WatchdogHistory || cfg.WatchdogWindow <= 0 || !finite(cfg.WatchdogQuantile) || cfg.WatchdogQuantile <= 0 || cfg.WatchdogQuantile > 1 || !finite(cfg.WatchdogMargin) || cfg.WatchdogMargin < 0 {
+		return nil, errors.New("dutyscheduler: invalid learned watchdog policy")
 	}
 	if cfg.Mode != ModeOff && len(cfg.Senders) == 0 {
 		return nil, errors.New("dutyscheduler: sender inventory is empty")
@@ -188,9 +266,10 @@ func New(cfg Config) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		cfg:     cfg,
-		senders: make(map[uint64]*senderRuntime, len(cfg.Senders)),
-		rng:     cfg.RandomSeed,
+		cfg:       cfg,
+		senders:   make(map[uint64]*senderRuntime, len(cfg.Senders)),
+		protocols: make(map[string]*protocolRuntime),
+		rng:       cfg.RandomSeed,
 	}
 	if s.rng == 0 {
 		s.rng = 0x9e3779b97f4a7c15
@@ -212,6 +291,8 @@ func New(cfg Config) (*Scheduler, error) {
 			return nil, err
 		}
 		c := &candidate{cfg: candidateCfg, senders: make(map[uint64]*senderModel, len(cfg.Senders))}
+		c.wakeScale = 1
+		c.epoch = 1
 		for _, senderCfg := range cfg.Senders {
 			c.senders[senderCfg.ID] = &senderModel{}
 		}
@@ -220,18 +301,86 @@ func New(cfg Config) (*Scheduler, error) {
 	return s, nil
 }
 
+func finite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+// Configuration returns the normalized controller configuration. Slice fields
+// are copied so callers cannot mutate a running scheduler through the result.
+func (s *Scheduler) Configuration() Config {
+	result := s.cfg
+	result.Senders = append([]SenderConfig(nil), s.cfg.Senders...)
+	result.Candidates = append([]CandidateConfig(nil), s.cfg.Candidates...)
+	return result
+}
+
+func normalizeConfig(cfg Config) Config {
+	if cfg.RefreshInterval == 0 {
+		cfg.RefreshInterval = 6 * time.Hour
+	}
+	if cfg.RefreshDuration == 0 {
+		cfg.RefreshDuration = 10 * time.Minute
+	}
+	if cfg.PromotionMargin == 0 {
+		cfg.PromotionMargin = 0.00025
+	}
+	if cfg.PromotionStability == 0 {
+		cfg.PromotionStability = 10 * time.Minute
+	}
+	if cfg.WatchdogHistory == 0 {
+		cfg.WatchdogHistory = 128
+	}
+	if cfg.WatchdogMinIntervals == 0 {
+		cfg.WatchdogMinIntervals = 16
+	}
+	if cfg.WatchdogWindow == 0 {
+		cfg.WatchdogWindow = 10 * time.Minute
+	}
+	if cfg.WatchdogQuantile == 0 {
+		cfg.WatchdogQuantile = 0.99
+	}
+	if cfg.WatchdogMargin == 0 {
+		cfg.WatchdogMargin = 0.25
+	}
+	for idx := range cfg.Candidates {
+		candidate := &cfg.Candidates[idx]
+		if candidate.MinHistoryLimit == 0 {
+			candidate.MinHistoryLimit = 8
+			if candidate.MinHistoryLimit > candidate.HistoryLimit {
+				candidate.MinHistoryLimit = candidate.HistoryLimit
+			}
+		}
+		if candidate.ChangePointScale == 0 {
+			candidate.ChangePointScale = 2
+		}
+		if candidate.HistoryGrowAfter == 0 {
+			candidate.HistoryGrowAfter = 8
+		}
+		if candidate.WakeScaleStep == 0 {
+			candidate.WakeScaleStep = 1.25
+		}
+		if candidate.MaxWakeScale == 0 {
+			candidate.MaxWakeScale = 4
+		}
+	}
+	return cfg
+}
+
 func validateCandidate(cfg CandidateConfig, minimumAudit float64) error {
-	if cfg.Name == "" || cfg.HistoryLimit < 2 || cfg.WarmupIntervals < 2 || cfg.WarmupIntervals > cfg.HistoryLimit {
+	if cfg.Name == "" || cfg.HistoryLimit < 2 || cfg.MinHistoryLimit < 2 || cfg.MinHistoryLimit > cfg.HistoryLimit || cfg.WarmupIntervals < 2 || cfg.WarmupIntervals > cfg.MinHistoryLimit {
 		return errors.New("dutyscheduler: invalid candidate history")
 	}
 	if cfg.R900Floor <= 0 || cfg.OtherFloor <= 0 || cfg.JitterMargin < 0 {
 		return errors.New("dutyscheduler: invalid candidate timing")
 	}
-	if cfg.JitterQuantile <= 0 || cfg.JitterQuantile > 1 || cfg.PreScale <= 0 || cfg.PostScale <= 0 {
+	if !finite(cfg.JitterQuantile) || !finite(cfg.PreScale) || !finite(cfg.PostScale) || cfg.JitterQuantile <= 0 || cfg.JitterQuantile > 1 || cfg.PreScale <= 0 || cfg.PostScale <= 0 {
 		return errors.New("dutyscheduler: invalid candidate fitting")
 	}
-	if cfg.AuditFraction < minimumAudit || cfg.AuditFraction > 1 {
+	if !finite(cfg.AuditFraction) || cfg.AuditFraction < minimumAudit || cfg.AuditFraction > 1 {
 		return errors.New("dutyscheduler: candidate audit is below the invariant")
+	}
+	if !finite(cfg.ChangePointScale) || !finite(cfg.WakeScaleStep) || !finite(cfg.MaxWakeScale) || cfg.ChangePointScale <= 0 || cfg.HistoryGrowAfter < 1 || cfg.WakeScaleStep <= 1 || cfg.MaxWakeScale < cfg.WakeScaleStep {
+		return errors.New("dutyscheduler: invalid adaptive controller policy")
 	}
 	return nil
 }
@@ -254,6 +403,14 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 	}
 	s.started = true
 	s.lastEnd = end
+	if s.refreshUntil > 0 && start >= s.refreshUntil {
+		if s.selected != nil {
+			s.selected.tightenAfterRefresh(start)
+			s.selected = nil
+		}
+		s.refreshUntil = 0
+		s.nextRefresh = 0
+	}
 
 	for _, c := range s.candidates {
 		c.lastEligible = c.allLearned()
@@ -273,9 +430,29 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 	}
 
 	s.checkWatchdogs(end)
+	s.refreshQualifications(end)
 	s.chooseCandidate()
 
 	decision := Decision{Decode: true, State: s.state(), Selected: s.selectedName()}
+	if s.selected != nil && end >= s.recoveryUntil {
+		if s.nextRefresh == 0 {
+			s.nextRefresh = end + s.selected.refreshInterval(s.cfg.RefreshInterval)
+		}
+		if end >= s.nextRefresh {
+			s.refreshUntil = end + s.cfg.RefreshDuration
+			s.nextRefresh = end + s.selected.refreshInterval(s.cfg.RefreshInterval)
+			s.refreshes++
+		}
+	}
+	if s.selected != nil && end < s.refreshUntil {
+		decision.Refresh = true
+		decision.State = s.state()
+		s.quietActive = false
+		s.auditActive = false
+		s.quietCandidate = ""
+		s.lastDecision = decision
+		return decision
+	}
 	sleepInterval := s.cfg.Mode == ModeGated && s.selected != nil && end >= s.recoveryUntil && s.selected.lastEligible && !s.selected.lastAwake
 	if !sleepInterval {
 		s.quietActive = false
@@ -286,7 +463,7 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 		if !s.quietActive || s.quietCandidate != selectedName {
 			s.quietActive = true
 			s.quietCandidate = selectedName
-			s.auditActive = s.randomUnit() < s.selected.cfg.AuditFraction
+			s.auditActive = s.randomUnit() < s.selected.auditFraction()
 		}
 		decision.Decode = s.auditActive
 		decision.Audit = s.auditActive
@@ -307,6 +484,10 @@ func (s *Scheduler) resetLearning() {
 		c.awakeDuration = 0
 		c.invalid = false
 		c.qualified = false
+		c.epoch++
+		c.promotionReady = 0
+		c.recoveryUntil = 0
+		c.wakeScale = 1
 	}
 	for _, sender := range s.senders {
 		sender.protocol = ""
@@ -315,13 +496,33 @@ func (s *Scheduler) resetLearning() {
 		sender.observations = sender.observations[:0]
 		sender.overdueOpen = false
 		sender.countOpen = false
+		sender.gaps = sender.gaps[:0]
+		sender.learnedOverdue = 0
+		sender.learnedMinimumCount = 0
+		sender.watchdogLearned = false
+		sender.obligationDue = 0
+		sender.obligationOpen = false
 	}
+	s.refreshUntil = 0
+	s.nextRefresh = 0
 }
 
 // Observe supplies one adjacent-deduplicated, configured-sender arrival. In
 // shadow mode every arrival is observed. In gated mode an arrival during an
 // audit is an escape and forces recovery.
 func (s *Scheduler) Observe(id uint64, protocol string, at time.Duration) {
+	s.observe(id, protocol, at, false)
+}
+
+// ObserveEscape supplies an arrival recovered from a block the scheduler had
+// elected not to decode. Replay happens after the clock has advanced into an
+// awake block, so the escape must be carried explicitly rather than inferred
+// from the current block decision.
+func (s *Scheduler) ObserveEscape(id uint64, protocol string, at time.Duration) {
+	s.observe(id, protocol, at, true)
+}
+
+func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forcedEscape bool) {
 	runtimeSender, configured := s.senders[id]
 	if !configured || at < 0 || (runtimeSender.seen && at <= runtimeSender.lastSeen) {
 		if configured && runtimeSender.seen && at < runtimeSender.lastSeen {
@@ -333,14 +534,29 @@ func (s *Scheduler) Observe(id uint64, protocol string, at time.Duration) {
 		s.enterRecovery(s.lastEnd)
 		return
 	}
+	previous := runtimeSender.lastSeen
+	hadPrevious := runtimeSender.seen
 	runtimeSender.protocol = protocol
 	runtimeSender.lastSeen = at
 	runtimeSender.seen = true
 	runtimeSender.total++
 	runtimeSender.overdueOpen = false
+	if runtimeSender.obligationOpen {
+		runtimeSender.obligationsClosed++
+		runtimeSender.obligationOpen = false
+	}
 	runtimeSender.observations = append(runtimeSender.observations, at)
-	if runtimeSender.cfg.CountWindow > 0 {
-		trimBefore := at - runtimeSender.cfg.CountWindow*2
+	if hadPrevious {
+		runtimeSender.gaps = append(runtimeSender.gaps, at-previous)
+		if len(runtimeSender.gaps) > s.cfg.WatchdogHistory {
+			copy(runtimeSender.gaps, runtimeSender.gaps[len(runtimeSender.gaps)-s.cfg.WatchdogHistory:])
+			runtimeSender.gaps = runtimeSender.gaps[:s.cfg.WatchdogHistory]
+		}
+		s.learnWatchdog(runtimeSender)
+	}
+	window := s.effectiveCountWindow(runtimeSender)
+	if window > 0 {
+		trimBefore := at - window*2
 		first := 0
 		for first < len(runtimeSender.observations) && runtimeSender.observations[first] < trimBefore {
 			first++
@@ -349,6 +565,19 @@ func (s *Scheduler) Observe(id uint64, protocol string, at time.Duration) {
 			copy(runtimeSender.observations, runtimeSender.observations[first:])
 			runtimeSender.observations = runtimeSender.observations[:len(runtimeSender.observations)-first]
 		}
+	}
+	if overdue := s.effectiveOverdue(runtimeSender); overdue > 0 {
+		runtimeSender.obligationDue = at + overdue
+		runtimeSender.obligationOpen = true
+		runtimeSender.obligationsOpened++
+	}
+	if protocol != "" {
+		totals := s.protocols[protocol]
+		if totals == nil {
+			totals = &protocolRuntime{}
+			s.protocols[protocol] = totals
+		}
+		totals.observations++
 	}
 
 	for _, c := range s.candidates {
@@ -359,27 +588,51 @@ func (s *Scheduler) Observe(id uint64, protocol string, at time.Duration) {
 				model.misses++
 			}
 		}
-		model.observe(protocol, at, c.cfg)
+		if model.observe(protocol, at, c.cfg, c.wakeScale) {
+			c.beginNewEpoch(at, true)
+		}
 	}
 
-	if s.cfg.Mode == ModeGated && s.selected != nil && s.selected.lastEligible && !s.selected.lastAwake {
-		s.invalidateAtLeast(s.selected.steadySleep())
+	if s.cfg.Mode == ModeGated && s.selected != nil && (forcedEscape || (s.selected.lastEligible && !s.selected.lastAwake)) {
+		s.recoverAtLeast(s.selected.steadySleep(), at)
 		s.enterRecovery(s.lastEnd)
 	}
-	s.refreshQualifications()
+	s.refreshQualifications(at)
 	s.chooseCandidate()
 }
 
-func (m *senderModel) observe(protocol string, at time.Duration, cfg CandidateConfig) {
+func (m *senderModel) observe(protocol string, at time.Duration, cfg CandidateConfig, wakeScale float64) bool {
+	changed := false
 	if m.protocol != "" && m.protocol != protocol {
 		m.history = m.history[:0]
 		m.seen = false
 		m.learned = false
+		m.effectiveHistory = 0
+		changed = true
 	}
 	m.protocol = protocol
 	if m.seen {
 		delta := at - m.last
 		if delta > 0 {
+			if m.learned && m.period > 0 {
+				multiple := math.Round(float64(delta) / float64(m.period))
+				if multiple < 1 {
+					multiple = 1
+				}
+				residual := time.Duration(math.Abs(float64(delta) - multiple*float64(m.period)))
+				tolerance := time.Duration(float64(maxDuration(m.preWake, m.postWake)) * cfg.ChangePointScale)
+				if tolerance < m.period/20 {
+					tolerance = m.period / 20
+				}
+				if residual > tolerance {
+					changed = true
+					m.changePoints++
+					m.stableIntervals = 0
+					m.effectiveHistory = min(cfg.MinHistoryLimit, len(m.history)+1)
+				} else {
+					m.stableIntervals++
+				}
+			}
 			m.history = append(m.history, delta)
 			if len(m.history) > cfg.HistoryLimit {
 				copy(m.history, m.history[len(m.history)-cfg.HistoryLimit:])
@@ -390,9 +643,20 @@ func (m *senderModel) observe(protocol string, at time.Duration, cfg CandidateCo
 	m.last = at
 	m.seen = true
 	if len(m.history) < cfg.WarmupIntervals {
-		return
+		return changed
 	}
-	period, residuals := robustPeriod(m.history)
+	if m.effectiveHistory == 0 {
+		m.effectiveHistory = min(len(m.history), cfg.MinHistoryLimit)
+	}
+	if m.stableIntervals >= cfg.HistoryGrowAfter && m.effectiveHistory < min(len(m.history), cfg.HistoryLimit) {
+		next := nextHistoryLimit(m.effectiveHistory, min(len(m.history), cfg.HistoryLimit))
+		if compatibleHistory(m.history, m.effectiveHistory, next, maxDuration(m.preWake, m.postWake)) {
+			m.effectiveHistory = next
+			m.stableIntervals = 0
+		}
+	}
+	history := m.history[len(m.history)-m.effectiveHistory:]
+	period, residuals := robustPeriod(history)
 	floor := cfg.OtherFloor
 	if strings.HasPrefix(strings.ToLower(protocol), "r900") {
 		floor = cfg.R900Floor
@@ -404,9 +668,82 @@ func (m *senderModel) observe(protocol string, at time.Duration, cfg CandidateCo
 	}
 	m.period = period
 	m.anchor = at
-	m.preWake = scaleDuration(halfwidth, cfg.PreScale)
-	m.postWake = scaleDuration(halfwidth, cfg.PostScale)
+	m.preWake = scaleDuration(halfwidth, cfg.PreScale*wakeScale)
+	m.postWake = scaleDuration(halfwidth, cfg.PostScale*wakeScale)
 	m.learned = period > 0
+	return changed
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func nextHistoryLimit(current, maximum int) int {
+	for _, candidate := range []int{8, 16, 32, 64, 128} {
+		if candidate > current {
+			return min(candidate, maximum)
+		}
+	}
+	return maximum
+}
+
+func compatibleHistory(history []time.Duration, recentCount, extendedCount int, tolerance time.Duration) bool {
+	if recentCount < 2 || extendedCount <= recentCount || extendedCount > len(history) {
+		return false
+	}
+	recent, _ := robustPeriod(history[len(history)-recentCount:])
+	extended, _ := robustPeriod(history[len(history)-extendedCount:])
+	if recent <= 0 || extended <= 0 {
+		return false
+	}
+	minimumTolerance := recent / 1000
+	if tolerance < minimumTolerance {
+		tolerance = minimumTolerance
+	}
+	return time.Duration(math.Abs(float64(recent-extended))) <= tolerance
+}
+
+func (c *candidate) beginNewEpoch(now time.Duration, widen bool) {
+	c.epoch++
+	c.qualified = false
+	c.promotionReady = 0
+	if widen {
+		c.wakeScale *= c.cfg.WakeScaleStep
+		if c.wakeScale > c.cfg.MaxWakeScale {
+			c.wakeScale = c.cfg.MaxWakeScale
+		}
+	}
+	for _, sender := range c.senders {
+		sender.events = 0
+		sender.misses = 0
+		if widen && sender.learned {
+			sender.preWake = scaleDuration(sender.preWake, c.cfg.WakeScaleStep)
+			sender.postWake = scaleDuration(sender.postWake, c.cfg.WakeScaleStep)
+		}
+	}
+	c.recoveryUntil = now
+}
+
+func (c *candidate) tightenAfterRefresh(now time.Duration) {
+	if c.wakeScale <= 1 {
+		return
+	}
+	oldScale := c.wakeScale
+	c.wakeScale /= c.cfg.WakeScaleStep
+	if c.wakeScale < 1 {
+		c.wakeScale = 1
+	}
+	ratio := c.wakeScale / oldScale
+	for _, sender := range c.senders {
+		if sender.learned {
+			sender.preWake = scaleDuration(sender.preWake, ratio)
+			sender.postWake = scaleDuration(sender.postWake, ratio)
+		}
+	}
+	c.beginNewEpoch(now, false)
 }
 
 func scaleDuration(value time.Duration, scale float64) time.Duration {
@@ -515,30 +852,96 @@ func durationQuantile(values []time.Duration, probability float64) time.Duration
 	return ordered[rank]
 }
 
+func (s *Scheduler) learnWatchdog(sender *senderRuntime) {
+	if len(sender.gaps) < s.cfg.WatchdogMinIntervals {
+		return
+	}
+	gap := durationQuantile(sender.gaps, s.cfg.WatchdogQuantile)
+	learned := time.Duration(float64(gap) * (1 + s.cfg.WatchdogMargin))
+	if learned <= 0 {
+		return
+	}
+	sender.learnedOverdue = learned
+	minimum := int(s.cfg.WatchdogWindow / learned)
+	if minimum < 1 {
+		minimum = 1
+	}
+	sender.learnedMinimumCount = minimum
+	sender.watchdogLearned = true
+}
+
+func (s *Scheduler) effectiveOverdue(sender *senderRuntime) time.Duration {
+	result := sender.cfg.Overdue
+	if sender.learnedOverdue > result {
+		result = sender.learnedOverdue
+	}
+	return result
+}
+
+func (s *Scheduler) effectiveCountWindow(sender *senderRuntime) time.Duration {
+	if sender.cfg.CountWindow > 0 {
+		return sender.cfg.CountWindow
+	}
+	if sender.watchdogLearned {
+		return s.cfg.WatchdogWindow
+	}
+	return 0
+}
+
+func (s *Scheduler) effectiveMinimumCount(sender *senderRuntime) int {
+	result := sender.cfg.MinimumCount
+	if sender.watchdogLearned && (result == 0 || sender.learnedMinimumCount < result) {
+		result = sender.learnedMinimumCount
+	}
+	return result
+}
+
+func (s *Scheduler) watchdogsReady() bool {
+	for _, sender := range s.senders {
+		seeded := sender.cfg.Overdue > 0 && sender.cfg.CountWindow > 0 && sender.cfg.MinimumCount > 0
+		if !seeded && !sender.watchdogLearned {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Scheduler) checkWatchdogs(now time.Duration) {
 	failed := false
 	for _, sender := range s.senders {
-		if sender.seen && sender.cfg.Overdue > 0 && now-sender.lastSeen > sender.cfg.Overdue {
+		overdue := s.effectiveOverdue(sender)
+		if sender.seen && sender.obligationOpen && overdue > 0 && now >= sender.obligationDue {
 			if !sender.overdueOpen {
 				s.deadlineDeficits++
 				sender.deadlineDeficits++
+				sender.obligationDeficits++
 				sender.overdueOpen = true
+				sender.obligationOpen = false
+				if totals := s.protocols[sender.protocol]; totals != nil {
+					totals.deadlineDeficits++
+					totals.obligationDeficits++
+				}
 				failed = true
 			}
 		}
-		if sender.cfg.MinimumCount > 0 && now >= sender.cfg.CountWindow {
-			lower := now - sender.cfg.CountWindow
+		window := s.effectiveCountWindow(sender)
+		minimum := s.effectiveMinimumCount(sender)
+		if sender.seen && minimum > 0 && window > 0 && now >= window {
+			lower := now - window
 			count := 0
 			for _, observed := range sender.observations {
 				if observed >= lower && observed <= now {
 					count++
 				}
 			}
-			deficit := count < sender.cfg.MinimumCount
+			deficit := count < minimum
 			if deficit && !sender.countOpen {
 				s.countDeficits++
 				sender.countDeficits++
 				sender.countOpen = true
+				if totals := s.protocols[sender.protocol]; totals != nil {
+					totals.countDeficits++
+				}
 				failed = true
 			} else if !deficit {
 				sender.countOpen = false
@@ -547,7 +950,7 @@ func (s *Scheduler) checkWatchdogs(now time.Duration) {
 	}
 	if failed && s.cfg.Mode == ModeGated && s.selected != nil && now >= s.recoveryUntil {
 		selectedSkip := s.selected.steadySleep()
-		s.invalidateAtLeast(selectedSkip)
+		s.recoverAtLeast(selectedSkip, now)
 		s.enterRecovery(now)
 	}
 }
@@ -561,19 +964,22 @@ func (s *Scheduler) enterRecovery(now time.Duration) {
 	s.quietActive = false
 	s.auditActive = false
 	s.quietCandidate = ""
+	s.refreshUntil = 0
+	s.nextRefresh = 0
 }
 
-func (s *Scheduler) invalidateAtLeast(skip float64) {
+func (s *Scheduler) recoverAtLeast(skip float64, now time.Duration) {
 	for _, c := range s.candidates {
 		if c.steadySleep() >= skip {
 			c.invalid = true
-			c.qualified = false
+			c.beginNewEpoch(now, true)
+			c.recoveryUntil = now + s.cfg.RecoveryDuration
 		}
 	}
 }
 
 func (s *Scheduler) chooseCandidate() {
-	if s.cfg.Mode != ModeGated || s.lastEnd < s.recoveryUntil {
+	if s.cfg.Mode != ModeGated || s.lastEnd < s.recoveryUntil || !s.watchdogsReady() {
 		s.selected = nil
 		return
 	}
@@ -589,11 +995,11 @@ func (s *Scheduler) chooseCandidate() {
 	s.selected = best
 }
 
-func (s *Scheduler) qualifies(c *candidate) bool {
+func (s *Scheduler) qualifiesAt(c *candidate, target float64) bool {
 	if c.invalid || !c.allLearned() || c.eligibleDuration <= 0 {
 		return false
 	}
-	maxMiss := 1 - s.cfg.CaptureTarget
+	maxMiss := 1 - target
 	alpha := 1 - s.cfg.Confidence
 	for _, sender := range c.senders {
 		if sender.events == 0 || upperMissBound(sender.misses, sender.events, alpha) > maxMiss {
@@ -603,9 +1009,29 @@ func (s *Scheduler) qualifies(c *candidate) bool {
 	return true
 }
 
-func (s *Scheduler) refreshQualifications() {
+func (s *Scheduler) refreshQualifications(now time.Duration) {
 	for _, c := range s.candidates {
-		c.qualified = s.qualifies(c)
+		if c.invalid && now >= c.recoveryUntil {
+			c.invalid = false
+		}
+		if c.qualified {
+			if !s.qualifiesAt(c, s.cfg.CaptureTarget) {
+				c.qualified = false
+				c.promotionReady = 0
+			}
+			continue
+		}
+		promotionTarget := s.cfg.CaptureTarget + s.cfg.PromotionMargin
+		if !s.qualifiesAt(c, promotionTarget) {
+			c.promotionReady = 0
+			continue
+		}
+		if c.promotionReady == 0 {
+			c.promotionReady = now + s.cfg.PromotionStability
+		}
+		if now >= c.promotionReady {
+			c.qualified = true
+		}
 	}
 }
 
@@ -624,7 +1050,26 @@ func (c *candidate) steadySleep() float64 {
 }
 
 func (c *candidate) effectiveSleep() float64 {
-	return c.steadySleep() * (1 - c.cfg.AuditFraction)
+	return c.steadySleep() * (1 - c.auditFraction())
+}
+
+func (c *candidate) auditFraction() float64 {
+	result := c.cfg.AuditFraction * c.wakeScale
+	if result > 1 {
+		return 1
+	}
+	return result
+}
+
+func (c *candidate) refreshInterval(base time.Duration) time.Duration {
+	if c.wakeScale <= 1 {
+		return base
+	}
+	interval := time.Duration(float64(base) / math.Min(c.wakeScale, 4))
+	if interval < time.Minute {
+		return time.Minute
+	}
+	return interval
 }
 
 func (s *Scheduler) randomUnit() float64 {
@@ -655,7 +1100,10 @@ func (s *Scheduler) state() string {
 	}
 	for _, c := range s.candidates {
 		if c.qualified {
-			return "QUALIFIED"
+			if s.watchdogsReady() {
+				return "QUALIFIED"
+			}
+			return "SEED"
 		}
 	}
 	return "SEED"
@@ -671,17 +1119,36 @@ func (s *Scheduler) Snapshot() Snapshot {
 		DeadlineDeficits: s.deadlineDeficits,
 		CountDeficits:    s.countDeficits,
 		Discontinuities:  s.discontinuities,
+		Refreshes:        s.refreshes,
+		RefreshUntilNS:   int64(s.refreshUntil),
+		NextRefreshNS:    int64(s.nextRefresh),
 		ObservedSenders:  make(map[uint64]ObservedSenderSnapshot, len(s.senders)),
+		Protocols:        make(map[string]ProtocolSnapshot, len(s.protocols)),
 	}
 	for id, sender := range s.senders {
 		result.ObservedSenders[id] = ObservedSenderSnapshot{
-			Protocol:         sender.protocol,
-			Observations:     sender.total,
-			LastSeenNS:       int64(sender.lastSeen),
-			DeadlineDeficits: sender.deadlineDeficits,
-			CountDeficits:    sender.countDeficits,
-			OverdueOpen:      sender.overdueOpen,
-			CountOpen:        sender.countOpen,
+			Protocol:            sender.protocol,
+			Observations:        sender.total,
+			LastSeenNS:          int64(sender.lastSeen),
+			DeadlineDeficits:    sender.deadlineDeficits,
+			CountDeficits:       sender.countDeficits,
+			OverdueOpen:         sender.overdueOpen,
+			CountOpen:           sender.countOpen,
+			WatchdogLearned:     sender.watchdogLearned,
+			LearnedOverdueNS:    int64(sender.learnedOverdue),
+			LearnedMinimumCount: sender.learnedMinimumCount,
+			ObligationDueNS:     sender.obligationDue.Nanoseconds(),
+			ObligationsOpened:   sender.obligationsOpened,
+			ObligationsClosed:   sender.obligationsClosed,
+			ObligationDeficits:  sender.obligationDeficits,
+		}
+	}
+	for protocol, totals := range s.protocols {
+		result.Protocols[protocol] = ProtocolSnapshot{
+			Observations:       totals.observations,
+			DeadlineDeficits:   totals.deadlineDeficits,
+			CountDeficits:      totals.countDeficits,
+			ObligationDeficits: totals.obligationDeficits,
 		}
 	}
 	alpha := 1 - s.cfg.Confidence
@@ -691,7 +1158,13 @@ func (s *Scheduler) Snapshot() Snapshot {
 			HistoryLimit:           c.cfg.HistoryLimit,
 			Eligible:               c.allLearned(),
 			Qualified:              c.qualified,
+			ContractQualified:      s.qualifiesAt(c, s.cfg.CaptureTarget),
 			Invalid:                c.invalid,
+			Epoch:                  c.epoch,
+			WakeScale:              c.wakeScale,
+			AuditFraction:          c.auditFraction(),
+			PromotionReadyNS:       int64(c.promotionReady),
+			RecoveryUntilNS:        int64(c.recoveryUntil),
 			ProjectedSleepFraction: c.projectedSleep(),
 			SteadySleepFraction:    c.steadySleep(),
 			EffectiveSleepFraction: c.effectiveSleep(),
@@ -717,6 +1190,8 @@ func (s *Scheduler) Snapshot() Snapshot {
 				PeriodNS:                int64(sender.period),
 				PreWakeNS:               int64(sender.preWake),
 				PostWakeNS:              int64(sender.postWake),
+				EffectiveHistory:        sender.effectiveHistory,
+				ChangePoints:            sender.changePoints,
 			}
 		}
 		result.Candidates = append(result.Candidates, candidateSnapshot)

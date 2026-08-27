@@ -27,6 +27,7 @@ type dutyCheckpointCandidate struct {
 	evidence        uint64
 	exact           bool
 	policyMigration bool
+	modeMigration   bool
 }
 
 func (d *dutyRuntime) restoreBestCheckpoint() error {
@@ -63,6 +64,13 @@ func (d *dutyRuntime) restoreBestCheckpoint() error {
 		candidates = append(candidates, candidate)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		if d.mode == dutyscheduler.ModeGated {
+			leftGated := candidates[i].report.Mode == dutyscheduler.ModeGated
+			rightGated := candidates[j].report.Mode == dutyscheduler.ModeGated
+			if leftGated != rightGated {
+				return leftGated
+			}
+		}
 		if candidates[i].evidence != candidates[j].evidence {
 			return candidates[i].evidence > candidates[j].evidence
 		}
@@ -84,6 +92,7 @@ func (d *dutyRuntime) restoreBestCheckpoint() error {
 	d.decodedBlocks = chosen.report.DecodedBlocks
 	d.skippedBlocks = chosen.report.SkippedBlocks
 	d.auditedBlocks = chosen.report.AuditedBlocks
+	d.refreshBlocks = chosen.report.RefreshBlocks
 	d.rebuilds = chosen.report.Rebuilds
 	d.replayedBlocks = chosen.report.ReplayedBlocks
 	d.startedUTC = started.UTC()
@@ -92,6 +101,8 @@ func (d *dutyRuntime) restoreBestCheckpoint() error {
 	status := "RESTORED_LEGACY"
 	if chosen.exact {
 		status = "RESTORED_EXACT"
+	} else if chosen.modeMigration {
+		status = "RESTORED_SHADOW_TO_GATED"
 	} else if chosen.policyMigration {
 		status = "RESTORED_POLICY_MIGRATION"
 	}
@@ -127,25 +138,29 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 	if err := d.validateCheckpointReport(report); err != nil {
 		return dutyCheckpointCandidate{}, err
 	}
-	ids := make([]uint64, 0, len(d.senderIDs))
-	for id := range d.senderIDs {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	schedulerConfig := dutyscheduler.DefaultConfig(d.mode, ids)
-	schedulerConfig.CaptureTarget = d.captureTarget
+	schedulerConfig := d.schedulerConfig
 	scheduler, err := dutyscheduler.New(schedulerConfig)
 	if err != nil {
 		return dutyCheckpointCandidate{}, err
 	}
 	exact := false
 	policyMigration := false
-	if report.Schema == "rtlamr-duty-scheduler-live-v3" {
+	modeMigration := false
+	if report.Schema == "rtlamr-duty-scheduler-live-v3" || report.Schema == "rtlamr-duty-scheduler-live-v4" {
 		err := scheduler.RestoreState(report.SchedulerState)
 		switch {
 		case err == nil:
 			exact = true
-		case errors.Is(err, dutyscheduler.ErrStateConfigurationMismatch):
+		case report.Mode == dutyscheduler.ModeShadow && d.mode == dutyscheduler.ModeGated:
+			if promotionErr := scheduler.RestoreShadowState(report.SchedulerState); promotionErr == nil {
+				modeMigration = true
+				break
+			}
+			if err := scheduler.RestoreLegacySnapshot(report.Snapshot); err != nil {
+				return dutyCheckpointCandidate{}, err
+			}
+			modeMigration = true
+		case errors.Is(err, dutyscheduler.ErrStateConfigurationMismatch), errors.Is(err, dutyscheduler.ErrStateSchemaMismatch):
 			if err := scheduler.RestoreLegacySnapshot(report.Snapshot); err != nil {
 				return dutyCheckpointCandidate{}, err
 			}
@@ -177,14 +192,16 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 		evidence:        dutyEvidenceCount(report.Snapshot),
 		exact:           exact,
 		policyMigration: policyMigration,
+		modeMigration:   modeMigration,
 	}, nil
 }
 
 func (d *dutyRuntime) validateCheckpointReport(report dutyRuntimeReport) error {
-	if report.Schema != "rtlamr-duty-scheduler-live-v2" && report.Schema != "rtlamr-duty-scheduler-live-v3" {
+	if report.Schema != "rtlamr-duty-scheduler-live-v2" && report.Schema != "rtlamr-duty-scheduler-live-v3" && report.Schema != "rtlamr-duty-scheduler-live-v4" {
 		return errors.New("dutyscheduler: unsupported checkpoint report")
 	}
-	if report.Mode != d.mode || report.Snapshot.Mode != d.mode || report.SampleRate != d.sampleRate || report.BlockSamples != d.blockSamples || report.BlockBytes != d.blockBytes || report.CollarBlocks != len(d.collar) || report.WarmupBlocks != d.warmupBlocks {
+	compatibleMode := report.Mode == d.mode || (report.Mode == dutyscheduler.ModeShadow && d.mode == dutyscheduler.ModeGated)
+	if !compatibleMode || report.Snapshot.Mode != report.Mode || report.SampleRate != d.sampleRate || report.BlockSamples != d.blockSamples || report.BlockBytes != d.blockBytes || report.CollarBlocks != len(d.collar) || report.WarmupBlocks != d.warmupBlocks {
 		return errors.New("dutyscheduler: checkpoint runtime mismatch")
 	}
 	created, err := time.Parse(time.RFC3339Nano, report.CreatedUTC)
@@ -219,7 +236,7 @@ func (d *dutyRuntime) validateCheckpointReport(report dutyRuntimeReport) error {
 	if report.DecodedBlocks > math.MaxUint64-report.SkippedBlocks || report.Snapshot.SampleTimeNS < 0 {
 		return errors.New("dutyscheduler: invalid checkpoint work")
 	}
-	if report.Schema == "rtlamr-duty-scheduler-live-v3" && report.SchedulerState.LastEndNS != report.Snapshot.SampleTimeNS {
+	if (report.Schema == "rtlamr-duty-scheduler-live-v3" || report.Schema == "rtlamr-duty-scheduler-live-v4") && report.SchedulerState.LastEndNS != report.Snapshot.SampleTimeNS {
 		return errors.New("dutyscheduler: checkpoint state clock mismatch")
 	}
 	return nil
@@ -248,7 +265,8 @@ func dutyEvidenceCount(snapshot dutyscheduler.Snapshot) uint64 {
 }
 
 func dutyCheckpointEvidenceMatches(restored, source dutyscheduler.Snapshot) bool {
-	if restored.Mode != source.Mode || restored.SampleTimeNS != source.SampleTimeNS || restored.DeadlineDeficits != source.DeadlineDeficits || restored.CountDeficits != source.CountDeficits || len(restored.ObservedSenders) != len(source.ObservedSenders) || len(restored.Candidates) != len(source.Candidates) {
+	compatibleMode := restored.Mode == source.Mode || (source.Mode == dutyscheduler.ModeShadow && restored.Mode == dutyscheduler.ModeGated)
+	if !compatibleMode || restored.SampleTimeNS != source.SampleTimeNS || restored.DeadlineDeficits != source.DeadlineDeficits || restored.CountDeficits != source.CountDeficits || len(restored.ObservedSenders) != len(source.ObservedSenders) || len(restored.Candidates) != len(source.Candidates) {
 		return false
 	}
 	for id, want := range source.ObservedSenders {

@@ -108,11 +108,40 @@ func TestDutyRuntimeReportIsAtomicAndComplete(t *testing.T) {
 	if err := json.Unmarshal(contents, &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Schema != "rtlamr-duty-scheduler-live-v3" || report.Mode != dutyscheduler.ModeShadow || report.CaptureTarget != 0.995 || report.Confidence != 0.95 || report.MinimumAudit != 0.10 || report.DecodedBlocks != 1 || report.SkippedBlocks != 0 || report.SchedulerState.Schema != dutyscheduler.StateSchema {
+	if report.Schema != "rtlamr-duty-scheduler-live-v4" || report.Mode != dutyscheduler.ModeShadow || report.CaptureTarget != 0.995 || report.Confidence != 0.95 || report.MinimumAudit != 0.10 || report.DecodedBlocks != 1 || report.SkippedBlocks != 0 || report.RefreshBlocks != 0 || report.SchedulerState.Schema != dutyscheduler.StateSchema {
 		t.Fatalf("unexpected report: %+v", report)
 	}
 	if len(report.SenderIDs) != 3 || report.SenderIDs[0] != 1 || report.SenderIDs[1] != 2 || report.SenderIDs[2] != 3 {
 		t.Fatalf("sender inventory is not canonical: %v", report.SenderIDs)
+	}
+}
+
+func TestShadowCheckpointPromotesToGatedWithRecovery(t *testing.T) {
+	directory := t.TempDir()
+	shadow, err := newDutyRuntime("shadow", dutyTestConfig(), dutyTestSenders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	for block := 0; block < 10; block++ {
+		start, end, decision := shadow.beginBlock()
+		shadow.finishBlock(make([]byte, shadow.blockBytes), start, end, time.Unix(int64(block), 0), decision)
+	}
+	if err := shadow.writeCheckpoint(time.Now(), "final"); err != nil {
+		t.Fatal(err)
+	}
+	gatedConfig := dutyscheduler.DefaultConfig(dutyscheduler.ModeGated, dutyTestSenders)
+	gated, err := newDutyRuntimeWithConfig(dutyTestConfig(), dutyTestSenders, gatedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gated.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if gated.resume.Status != "RESTORED_SHADOW_TO_GATED" || gated.scheduler.Snapshot().State != "RECOVERY" || gated.decodedBlocks != shadow.decodedBlocks {
+		t.Fatalf("shadow checkpoint did not promote safely: resume=%+v snapshot=%+v", gated.resume, gated.scheduler.Snapshot())
 	}
 }
 
@@ -348,6 +377,80 @@ func TestDutyCheckpointMigratesCaptureTargetWithoutLosingEvidence(t *testing.T) 
 	}
 }
 
+func TestDutyCheckpointRestoresCustomPolicyExactly(t *testing.T) {
+	directory := t.TempDir()
+	config := dutyscheduler.DefaultConfig(dutyscheduler.ModeShadow, dutyTestSenders)
+	config.RefreshInterval = 8 * time.Hour
+	config.RefreshDuration = 12 * time.Minute
+	config.MinimumAudit = 0.20
+	for idx := range config.Candidates {
+		config.Candidates[idx].AuditFraction = 0.20
+	}
+	original, err := newDutyRuntimeWithConfig(dutyTestConfig(), dutyTestSenders, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := original.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	advanceDutyRuntime(original, 12_000)
+	if err := original.writeCheckpoint(original.startedUTC.Add(time.Hour), "hourly"); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := newDutyRuntimeWithConfig(dutyTestConfig(), dutyTestSenders, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if restored.resume.Status != "RESTORED_EXACT" || restored.refreshInterval != 8*time.Hour || restored.minimumAudit != 0.20 {
+		t.Fatalf("custom policy did not resume exactly: resume=%+v refresh=%s audit=%f", restored.resume, restored.refreshInterval, restored.minimumAudit)
+	}
+}
+
+func TestGatedCheckpointTakesPriorityOverLargerShadowSession(t *testing.T) {
+	directory := t.TempDir()
+	gated, err := newDutyRuntime("gated", dutyTestConfig(), dutyTestSenders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gated.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	advanceDutyRuntime(gated, 7_000)
+	if err := gated.writeCheckpoint(gated.startedUTC.Add(time.Hour), "hourly"); err != nil {
+		t.Fatal(err)
+	}
+
+	shadow, err := newDutyRuntime("shadow", dutyTestConfig(), dutyTestSenders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	advanceDutyRuntime(shadow, 15_000)
+	if shadow.decodedBlocks <= gated.decodedBlocks {
+		t.Fatal("shadow fixture is not the larger session")
+	}
+	if err := shadow.writeCheckpoint(shadow.startedUTC.Add(time.Hour), "hourly"); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := newDutyRuntime("gated", dutyTestConfig(), dutyTestSenders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.configureCheckpoints(directory, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if restored.resume.Status != "RESTORED_EXACT" || restored.decodedBlocks != gated.decodedBlocks {
+		t.Fatalf("gated restore replaced gated evidence with shadow evidence: resume=%+v blocks=%d want=%d", restored.resume, restored.decodedBlocks, gated.decodedBlocks)
+	}
+}
+
 func TestDutyCheckpointIgnoresCorruptFileAndSelectsLargestSession(t *testing.T) {
 	directory := t.TempDir()
 	makeLegacy := func(name string, blocks int) uint64 {
@@ -540,5 +643,162 @@ func TestDutyShadowPreservesExternalCorpusMessages(t *testing.T) {
 	}
 	if shadowReceiver.duty.skippedBlocks != 0 || shadowReceiver.duty.decodedBlocks != uint64(len(input)/shadowReceiver.d.Cfg.BlockSize2) {
 		t.Fatalf("shadow changed decode inventory: decoded=%d skipped=%d", shadowReceiver.duty.decodedBlocks, shadowReceiver.duty.skippedBlocks)
+	}
+}
+
+func TestDutyGatedCollarReconstructionPreservesExternalCorpusMessages(t *testing.T) {
+	path := os.Getenv("RTLAMR_DUTY_CORPUS")
+	if path == "" {
+		t.Skip("RTLAMR_DUTY_CORPUS is not set")
+	}
+	input, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousEncoder := encoder
+	previousSingle := *single
+	defer func() {
+		encoder = previousEncoder
+		*single = previousSingle
+	}()
+	*single = false
+
+	newReceiver := func(gated bool) *Receiver {
+		receiver := &Receiver{protocolNames: []string{"idm", "r900"}}
+		receiver.d, err = receiver.newProtocolDecoder()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gated {
+			receiver.duty, err = newDutyRuntime("gated", receiver.d.Cfg, dutyTestSenders)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return receiver
+	}
+	newState := func() receiverRunState {
+		return receiverRunState{
+			prev:     make(map[protocol.Digest]bool),
+			next:     make(map[protocol.Digest]bool),
+			dutyPrev: make(map[protocol.Digest]bool),
+			dutyNext: make(map[protocol.Digest]bool),
+		}
+	}
+
+	baselineReceiver := newReceiver(false)
+	if len(input)%baselineReceiver.d.Cfg.BlockSize2 != 0 {
+		t.Fatalf("corpus size %d is not block aligned to %d", len(input), baselineReceiver.d.Cfg.BlockSize2)
+	}
+	baselineCapture := &dutyCaptureEncoder{}
+	encoder = baselineCapture
+	baselineState := newState()
+	blockBytes := baselineReceiver.d.Cfg.BlockSize2
+	blocks := len(input) / blockBytes
+	baselineMessageBlocks := make([]int, 0)
+	for block, offset := 0, 0; offset < len(input); block, offset = block+1, offset+blockBytes {
+		before := len(baselineCapture.digests)
+		messages := baselineReceiver.d.Decode(input[offset : offset+blockBytes])
+		if _, keepRunning := baselineReceiver.processDecodedMessages(&baselineState, messages, 0, time.Time{}, true, false, false); !keepRunning {
+			t.Fatalf("baseline decode failed at offset %d: %v", offset, baselineReceiver.err)
+		}
+		if len(baselineCapture.digests) > before {
+			baselineMessageBlocks = append(baselineMessageBlocks, block)
+		}
+	}
+	if len(baselineCapture.digests) == 0 {
+		t.Fatal("corpus replay was vacuous")
+	}
+	protected := make([]bool, blocks)
+	guardBlocks := 5 * int((baselineReceiver.d.Cfg.SampleRate+baselineReceiver.d.Cfg.BlockSize-1)/baselineReceiver.d.Cfg.BlockSize)
+	for _, messageBlock := range baselineMessageBlocks {
+		first := messageBlock - guardBlocks
+		if first < 0 {
+			first = 0
+		}
+		last := messageBlock + guardBlocks
+		if last >= blocks {
+			last = blocks - 1
+		}
+		for block := first; block <= last; block++ {
+			protected[block] = true
+		}
+	}
+
+	gatedReceiver := newReceiver(true)
+	gatedCapture := &dutyCaptureEncoder{}
+	encoder = gatedCapture
+	gatedState := newState()
+	warmup := len(gatedReceiver.duty.collar)
+	if len(gatedReceiver.duty.collar) <= gatedReceiver.duty.warmupBlocks+2 {
+		t.Fatal("test geometry cannot retain one sleep/wake boundary")
+	}
+	skipBurst := 1
+	wakeBurst := int((gatedReceiver.duty.sampleRate + gatedReceiver.duty.blockSamples - 1) / gatedReceiver.duty.blockSamples)
+	transition := 0
+	for block, offset := 0, 0; offset < len(input); block, offset = block+1, offset+blockBytes {
+		data := input[offset : offset+blockBytes]
+		start, end, _ := gatedReceiver.duty.beginBlock()
+		decode := block < warmup
+		if !decode {
+			cycle := (block - warmup) % (skipBurst + wakeBurst)
+			decode = cycle >= skipBurst
+		}
+		if protected[block] {
+			decode = true
+		}
+		decision := dutyscheduler.Decision{Decode: decode}
+		if gatedReceiver.duty.needsRebuild(decision) {
+			transition++
+			if transition%2 == 0 {
+				decision.Audit = true
+			} else {
+				decision.Refresh = true
+			}
+			if _, keepRunning := gatedReceiver.rebuildDutyDecoder(&gatedState); !keepRunning {
+				t.Fatalf("collar rebuild failed at block %d: %v", block, gatedReceiver.err)
+			}
+		}
+		if decision.Decode {
+			messages := gatedReceiver.d.Decode(data)
+			if _, keepRunning := gatedReceiver.processDecodedMessages(&gatedState, messages, end, time.Time{}, true, true, false); !keepRunning {
+				t.Fatalf("gated decode failed at block %d: %v", block, gatedReceiver.err)
+			}
+		}
+		gatedReceiver.duty.finishBlock(data, start, end, time.Time{}, decision)
+	}
+	if gatedReceiver.duty.wasSkipped {
+		if _, keepRunning := gatedReceiver.rebuildDutyDecoder(&gatedState); !keepRunning {
+			t.Fatalf("final collar rebuild failed: %v", gatedReceiver.err)
+		}
+	}
+	if !reflect.DeepEqual(gatedCapture.digests, baselineCapture.digests) {
+		baselineUnique := make(map[protocol.Digest]uint64)
+		gatedUnique := make(map[protocol.Digest]uint64)
+		for _, digest := range baselineCapture.digests {
+			baselineUnique[digest]++
+		}
+		for _, digest := range gatedCapture.digests {
+			gatedUnique[digest]++
+		}
+		sameCounts := reflect.DeepEqual(baselineUnique, gatedUnique)
+		sharedUnique := 0
+		for digest := range baselineUnique {
+			if _, ok := gatedUnique[digest]; ok {
+				sharedUnique++
+			}
+		}
+		firstDifference := -1
+		for idx := 0; idx < len(baselineCapture.digests) && idx < len(gatedCapture.digests); idx++ {
+			if baselineCapture.digests[idx] != gatedCapture.digests[idx] {
+				firstDifference = idx
+				break
+			}
+		}
+		t.Fatalf("gated collar messages differ: baseline=%d/%d-unique gated=%d/%d-unique shared-unique=%d same-counts=%v first-difference=%d", len(baselineCapture.digests), len(baselineUnique), len(gatedCapture.digests), len(gatedUnique), sharedUnique, sameCounts, firstDifference)
+	}
+	if gatedReceiver.duty.skippedBlocks == 0 || gatedReceiver.duty.rebuilds == 0 || gatedReceiver.duty.replayedBlocks == 0 || gatedReceiver.duty.auditedBlocks == 0 || gatedReceiver.duty.refreshBlocks == 0 {
+		t.Fatalf("transition exercise was incomplete: skipped=%d rebuilds=%d replayed=%d audited=%d refresh=%d", gatedReceiver.duty.skippedBlocks, gatedReceiver.duty.rebuilds, gatedReceiver.duty.replayedBlocks, gatedReceiver.duty.auditedBlocks, gatedReceiver.duty.refreshBlocks)
 	}
 }
