@@ -85,6 +85,39 @@ func TestUpperMissBoundQualificationBoundary(t *testing.T) {
 	}
 }
 
+func TestConfidenceBoundCacheInvalidatesOnlyOnEvidenceChange(t *testing.T) {
+	model := &senderModel{events: 1500, misses: 1}
+	alpha := 0.05
+	want := upperMissBound(model.misses, model.events, alpha)
+	if got := model.confidenceUpperBound(alpha); got != want || model.boundEvaluations != 1 {
+		t.Fatalf("initial bound=%f evaluations=%d want=%f,1", got, model.boundEvaluations, want)
+	}
+	for iteration := 0; iteration < 1000; iteration++ {
+		if got := model.confidenceUpperBound(alpha); got != want {
+			t.Fatalf("cached bound changed at iteration %d: got=%f want=%f", iteration, got, want)
+		}
+	}
+	if model.boundEvaluations != 1 {
+		t.Fatalf("unchanged evidence caused %d evaluations, want 1", model.boundEvaluations)
+	}
+
+	model.events++
+	want = upperMissBound(model.misses, model.events, alpha)
+	if got := model.confidenceUpperBound(alpha); got != want || model.boundEvaluations != 2 {
+		t.Fatalf("event invalidation bound=%f evaluations=%d want=%f,2", got, model.boundEvaluations, want)
+	}
+	model.misses++
+	want = upperMissBound(model.misses, model.events, alpha)
+	if got := model.confidenceUpperBound(alpha); got != want || model.boundEvaluations != 3 {
+		t.Fatalf("miss invalidation bound=%f evaluations=%d want=%f,3", got, model.boundEvaluations, want)
+	}
+	alpha = 0.01
+	want = upperMissBound(model.misses, model.events, alpha)
+	if got := model.confidenceUpperBound(alpha); got != want || model.boundEvaluations != 4 {
+		t.Fatalf("confidence invalidation bound=%f evaluations=%d want=%f,4", got, model.boundEvaluations, want)
+	}
+}
+
 func TestRequiredObservationsMatchesExactQualificationBoundary(t *testing.T) {
 	if got := RequiredObservations(0, 0.999, 0.95); got != 2995 {
 		t.Fatalf("zero-miss required observations=%d want=2995", got)
@@ -621,6 +654,35 @@ func BenchmarkShadowCandidateBankBlock(b *testing.B) {
 			sender.anchor = 0
 			sender.preWake = time.Second
 			sender.postWake = time.Second
+		}
+	}
+	const block = 3472222 * time.Nanosecond
+	b.ReportAllocs()
+	b.ResetTimer()
+	for idx := 0; idx < b.N; idx++ {
+		start := time.Duration(idx) * block
+		scheduler.Advance(start, start+block)
+	}
+}
+
+func BenchmarkShadowCandidateBankEstimatingBlock(b *testing.B) {
+	scheduler, err := New(testConfig(ModeShadow))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, candidate := range scheduler.candidates {
+		candidate.eligibleDuration = time.Hour
+		for id, sender := range candidate.senders {
+			sender.learned = true
+			sender.period = 28 * time.Second
+			sender.anchor = 0
+			sender.preWake = time.Second
+			sender.postWake = time.Second
+			sender.events = 1500
+			if id == 1 {
+				sender.period = 60 * time.Second
+				sender.misses = 1
+			}
 		}
 	}
 	const block = 3472222 * time.Nanosecond

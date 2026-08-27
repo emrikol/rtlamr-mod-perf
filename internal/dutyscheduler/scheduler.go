@@ -165,6 +165,12 @@ type senderModel struct {
 	effectiveHistory int
 	stableIntervals  int
 	changePoints     uint64
+	boundEvents      uint64
+	boundMisses      uint64
+	boundAlpha       float64
+	boundUpper       float64
+	boundValid       bool
+	boundEvaluations uint64
 }
 
 type candidate struct {
@@ -1002,7 +1008,7 @@ func (s *Scheduler) qualifiesAt(c *candidate, target float64) bool {
 	maxMiss := 1 - target
 	alpha := 1 - s.cfg.Confidence
 	for _, sender := range c.senders {
-		if sender.events == 0 || upperMissBound(sender.misses, sender.events, alpha) > maxMiss {
+		if sender.events == 0 || sender.confidenceUpperBound(alpha) > maxMiss {
 			return false
 		}
 	}
@@ -1186,7 +1192,7 @@ func (s *Scheduler) Snapshot() Snapshot {
 				WouldMiss:               sender.misses,
 				RequiredEligibleEvents:  required,
 				RemainingEligibleEvents: remaining,
-				UpperMissBound:          upperMissBound(sender.misses, sender.events, alpha),
+				UpperMissBound:          sender.confidenceUpperBound(alpha),
 				PeriodNS:                int64(sender.period),
 				PreWakeNS:               int64(sender.preWake),
 				PostWakeNS:              int64(sender.postWake),
@@ -1197,6 +1203,24 @@ func (s *Scheduler) Snapshot() Snapshot {
 		result.Candidates = append(result.Candidates, candidateSnapshot)
 	}
 	return result
+}
+
+// confidenceUpperBound memoizes the exact confidence calculation for one
+// evidence tuple. Advance evaluates qualification for every input block, but
+// the tuple changes only when a configured sender is observed. Keeping the
+// cache on the model preserves exact qualification and timer behavior without
+// repeating the numerical solver for unchanged evidence.
+func (m *senderModel) confidenceUpperBound(alpha float64) float64 {
+	if m.boundValid && m.boundEvents == m.events && m.boundMisses == m.misses && m.boundAlpha == alpha {
+		return m.boundUpper
+	}
+	m.boundEvents = m.events
+	m.boundMisses = m.misses
+	m.boundAlpha = alpha
+	m.boundUpper = upperMissBound(m.misses, m.events, alpha)
+	m.boundValid = true
+	m.boundEvaluations++
+	return m.boundUpper
 }
 
 // RequiredObservations returns the smallest total observation count that
