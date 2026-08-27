@@ -44,6 +44,18 @@ optional direct RTL-SDR input path when their runtime gates pass.
   cadence phase; those arrivals are not scored as capture evidence, so process
   downtime cannot masquerade as RF drift. Optional site-specific seeds belong
   in a protected runtime policy file, never in the public binary.
+- In one short, anonymized live validation at a configurable 99% contract,
+  gated mode used **11.0% less process CPU** than the already optimized
+  continuous-DSP control over the predeclared 120-second window; a five-minute
+  confirmation measured **14.5% less**. No new selected-candidate escape was
+  observed, but 99% is a statistical upper risk bound—not a measured 1% loss.
+  Both measured windows used less CPU; deployment policy should restore
+  continuous DSP automatically if a gated validation is not cheaper. A later
+  five-minute production validation measured **17.9% less process CPU**. Its
+  attached profile found the remaining work split across DSP, kernel USB
+  completion, and the scheduler's raw-IQ collar copy rather than one dominant
+  Go routine. See
+  [CPU savings versus capture risk](PERFORMANCE.md#cpu-savings-versus-capture-risk).
 - The bundled collector has an opt-in 60-second change-or-heartbeat policy for
   R900 data. It emits field changes immediately while bounding unchanged
   heartbeat writes.

@@ -232,6 +232,56 @@ Example policy using a synthetic sender ID:
 The scheduler remains opt-in. Qualification is evidence for a reversible gated
 trial, not a claim that every RF environment is stationary or lossless.
 
+### CPU savings versus capture risk
+
+A short anonymized live trial tested a qualified conservative policy at a
+configurable 99% capture target. It used the same optimized decoder and
+continuous SDR ingestion for both conditions. After the required ten-minute
+continuous-DSP recovery, the scheduler entered gated mode automatically.
+
+The continuous-DSP control used 4.211% of one CPU core. The predeclared
+120-second gated window used 3.748%, an **11.01% relative reduction**. A longer
+five-minute confirmation used 3.602%, a **14.46% relative reduction**. The
+gated report recorded roughly 86,000 skipped DSP blocks, its selected candidate
+added no new projected escape, all configured output streams remained fresh,
+and no gated-window restart, checkpoint failure, or hardware-throttle event was
+observed.
+
+The 99% target does **not** mean the trial measured a 1% accuracy loss. It means
+each sender had enough prior shadow evidence for the one-sided 95% confidence
+upper bound on its *scheduler-induced* miss rate to be at most 1%. The short
+gated window added no candidate miss, but it cannot prove that an unaudited
+skipped transmission never occurred. Ordinary RF loss and decoder limitations
+are also outside that scheduler-only contract. Random audits, per-sender
+obligations, count watchdogs, periodic continuous-DSP refresh, and immediate
+fail-open recovery therefore remain part of the safety model.
+
+The operational deployment rule is the configured per-sender capture SLA plus
+a measured CPU improvement over continuous DSP; it does not require an
+arbitrary minimum percentage. Both windows cleared that rule. A reversible
+deployment controller should automatically restore continuous DSP when its
+gated validation is equal to or more expensive than the control. In plain
+terms, this trial found roughly 11--14% less decoder CPU in exchange for a
+statistically bounded scheduler risk below 1%, not a measured 1% reduction in
+decoded-message accuracy.
+
+A later five-minute production validation used 3.456% of one core, **17.94%
+less** than the 4.211% continuous-DSP control. An attached, restart-free
+120-second profile captured 787 cycle samples with none lost. Its largest flat
+costs were the fused ARM64 power/Manchester path (15.76%), kernel USB completion
+copy-to-user (12.39%), the scheduler's raw-IQ collar `memmove` (10.19%), USB
+submit locking (4.93%), and dual-protocol search (2.36%). These percentages are
+fractions of the remaining 3.456%-of-one-core workload, not percentages of a
+whole core.
+
+The collar currently owns a copy of every input block so skipped IQ can be
+replayed safely when decoding wakes. The rebuild algorithm only consumes
+skipped entries on a short wake; after a long sleep every retained collar entry
+is also skipped. Copying only skipped blocks is therefore the clearest next Go
+optimization to prove with wrap, rebuild, replay, and message-equivalence tests.
+Kernel USB completion copying is a harder architectural ceiling and cannot be
+removed by ordinary Go allocation cleanup.
+
 ## Collector write coalescing
 
 `cmd/rtlamr-collect` includes an opt-in R900 change-or-heartbeat coalescer. When
