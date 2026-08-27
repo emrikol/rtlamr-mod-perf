@@ -2,6 +2,7 @@ package dutyscheduler
 
 import (
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -48,8 +49,10 @@ func DefaultSenderConfig(id uint64) SenderConfig {
 }
 
 func DefaultConfig(mode Mode, senderIDs []uint64) Config {
-	senders := make([]SenderConfig, 0, len(senderIDs))
-	for _, id := range senderIDs {
+	canonicalIDs := append([]uint64(nil), senderIDs...)
+	sort.Slice(canonicalIDs, func(i, j int) bool { return canonicalIDs[i] < canonicalIDs[j] })
+	senders := make([]SenderConfig, 0, len(canonicalIDs))
+	for _, id := range canonicalIDs {
 		senders = append(senders, DefaultSenderConfig(id))
 	}
 	return Config{

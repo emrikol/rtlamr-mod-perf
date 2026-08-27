@@ -152,6 +152,27 @@ func TestDefaultSenderConfigIsSiteIndependent(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigCanonicalizesSenderOrder(t *testing.T) {
+	first := DefaultConfig(ModeShadow, []uint64{3, 1, 2})
+	second := DefaultConfig(ModeShadow, []uint64{2, 3, 1})
+	firstFingerprint, err := configSHA256(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFingerprint, err := configSHA256(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstFingerprint != secondFingerprint {
+		t.Fatalf("sender order changed config fingerprint: %s != %s", firstFingerprint, secondFingerprint)
+	}
+	for index, sender := range first.Senders {
+		if sender.ID != uint64(index+1) {
+			t.Fatalf("canonical sender %d has ID %d", index, sender.ID)
+		}
+	}
+}
+
 func TestUpperMissBoundMonotonicProperties(t *testing.T) {
 	random := rand.New(rand.NewSource(1))
 	for iteration := 0; iteration < 1000; iteration++ {
