@@ -693,6 +693,34 @@ func TestDutyRestoreExternalCaptureTarget(t *testing.T) {
 			t.Fatalf("external target migration retained candidate %s qualification", candidate.Name)
 		}
 	}
+	reanchorAt := time.Duration(source.SchedulerState.LastEndNS) + 13*time.Second
+	decision := runtime.scheduler.Advance(time.Duration(source.SchedulerState.LastEndNS), reanchorAt)
+	if !decision.Decode || decision.Selected != "" {
+		t.Fatalf("external target migration was not fail-open before reanchor: %+v", decision)
+	}
+	for _, sender := range source.SchedulerState.Senders {
+		if sender.Protocol == "" {
+			t.Fatal("external target checkpoint sender has no protocol")
+		}
+		runtime.scheduler.Observe(sender.ID, sender.Protocol, reanchorAt)
+	}
+	reanchored, err := runtime.scheduler.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx, candidate := range reanchored.Candidates {
+		for senderIdx, model := range candidate.Senders {
+			before := restored.Candidates[idx].Senders[senderIdx]
+			if model.Events != before.Events || model.Misses != before.Misses || model.ChangePoints != before.ChangePoints || !reflect.DeepEqual(model.HistoryNS, before.HistoryNS) {
+				t.Fatalf("external target migration reset candidate %s during resume reanchor", candidate.Name)
+			}
+		}
+	}
+	for idx, sender := range reanchored.Senders {
+		if !reflect.DeepEqual(sender.GapsNS, restored.Senders[idx].GapsNS) {
+			t.Fatalf("external target migration added process downtime for sender %d", sender.ID)
+		}
+	}
 	t.Logf("status=%s source_sequence=%d blocks=%d evidence=%d", runtime.resume.Status, runtime.resume.SourceSequence, runtime.decodedBlocks, dutyEvidenceCount(runtime.scheduler.Snapshot()))
 }
 

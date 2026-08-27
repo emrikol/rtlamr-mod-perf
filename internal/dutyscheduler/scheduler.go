@@ -239,6 +239,7 @@ type Scheduler struct {
 	nextRefresh      time.Duration
 	refreshes        uint64
 	protocols        map[string]*protocolRuntime
+	reanchorPending  map[uint64]bool
 }
 
 func New(cfg Config) (*Scheduler, error) {
@@ -272,10 +273,11 @@ func New(cfg Config) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		cfg:       cfg,
-		senders:   make(map[uint64]*senderRuntime, len(cfg.Senders)),
-		protocols: make(map[string]*protocolRuntime),
-		rng:       cfg.RandomSeed,
+		cfg:             cfg,
+		senders:         make(map[uint64]*senderRuntime, len(cfg.Senders)),
+		protocols:       make(map[string]*protocolRuntime),
+		reanchorPending: make(map[uint64]bool),
+		rng:             cfg.RandomSeed,
 	}
 	if s.rng == 0 {
 		s.rng = 0x9e3779b97f4a7c15
@@ -528,6 +530,23 @@ func (s *Scheduler) ObserveEscape(id uint64, protocol string, at time.Duration) 
 	s.observe(id, protocol, at, true)
 }
 
+// PrepareResume keeps a complete checkpoint fail-open until every previously
+// seen sender has supplied one live post-restart arrival. That first arrival
+// reanchors cadence phase without treating process downtime as RF drift or as
+// capture evidence.
+func (s *Scheduler) PrepareResume() {
+	clear(s.reanchorPending)
+	for id, sender := range s.senders {
+		if sender.seen {
+			s.reanchorPending[id] = true
+		}
+	}
+	s.selected = nil
+	s.quietActive = false
+	s.auditActive = false
+	s.quietCandidate = ""
+}
+
 func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forcedEscape bool) {
 	runtimeSender, configured := s.senders[id]
 	if !configured || at < 0 || (runtimeSender.seen && at <= runtimeSender.lastSeen) {
@@ -542,6 +561,7 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 	}
 	previous := runtimeSender.lastSeen
 	hadPrevious := runtimeSender.seen
+	reanchor := s.reanchorPending[id]
 	runtimeSender.protocol = protocol
 	runtimeSender.lastSeen = at
 	runtimeSender.seen = true
@@ -552,7 +572,7 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 		runtimeSender.obligationOpen = false
 	}
 	runtimeSender.observations = append(runtimeSender.observations, at)
-	if hadPrevious {
+	if hadPrevious && !reanchor {
 		runtimeSender.gaps = append(runtimeSender.gaps, at-previous)
 		if len(runtimeSender.gaps) > s.cfg.WatchdogHistory {
 			copy(runtimeSender.gaps, runtimeSender.gaps[len(runtimeSender.gaps)-s.cfg.WatchdogHistory:])
@@ -588,6 +608,10 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 
 	for _, c := range s.candidates {
 		model := c.senders[id]
+		if reanchor {
+			model.reanchor(protocol, at)
+			continue
+		}
 		if c.lastEligible {
 			model.events++
 			if !c.lastAwake {
@@ -597,6 +621,9 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 		if model.observe(protocol, at, c.cfg, c.wakeScale) {
 			c.beginNewEpoch(at, true)
 		}
+	}
+	if reanchor {
+		delete(s.reanchorPending, id)
 	}
 
 	if s.cfg.Mode == ModeGated && s.selected != nil && (forcedEscape || (s.selected.lastEligible && !s.selected.lastAwake)) {
@@ -678,6 +705,13 @@ func (m *senderModel) observe(protocol string, at time.Duration, cfg CandidateCo
 	m.postWake = scaleDuration(halfwidth, cfg.PostScale*wakeScale)
 	m.learned = period > 0
 	return changed
+}
+
+func (m *senderModel) reanchor(protocol string, at time.Duration) {
+	m.protocol = protocol
+	m.last = at
+	m.anchor = at
+	m.seen = true
 }
 
 func maxDuration(left, right time.Duration) time.Duration {
@@ -985,7 +1019,7 @@ func (s *Scheduler) recoverAtLeast(skip float64, now time.Duration) {
 }
 
 func (s *Scheduler) chooseCandidate() {
-	if s.cfg.Mode != ModeGated || s.lastEnd < s.recoveryUntil || !s.watchdogsReady() {
+	if s.cfg.Mode != ModeGated || s.lastEnd < s.recoveryUntil || len(s.reanchorPending) > 0 || !s.watchdogsReady() {
 		s.selected = nil
 		return
 	}

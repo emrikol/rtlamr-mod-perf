@@ -144,6 +144,14 @@ evidence but forces cadence relearning. Compatible shadow checkpoints may be
 promoted into gated mode without repeating the entire evidence run, but every
 promotion and gated restart begins with continuous-DSP recovery.
 
+After any complete-state resume, the scheduler also waits fail-open for one
+live arrival from every previously seen sender. Each first arrival shifts that
+sender's cadence anchor to the new sample stream without adding a watchdog gap,
+capture event, miss, or change point. Normal scoring resumes afterward. This is
+necessary because the decoder's sample clock counts ingested IQ rather than
+wall time; treating process downtime as a sampled interval would manufacture a
+phase discontinuity and unnecessarily discard a valid evidence epoch.
+
 The exact Clopper-Pearson bound is cached by each sender's evidence tuple
 (`events`, `misses`, and confidence alpha). Qualification timers and fail-open
 checks still run for every block, but unchanged evidence does not repeat the

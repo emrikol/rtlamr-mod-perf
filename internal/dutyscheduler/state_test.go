@@ -158,6 +158,86 @@ func TestCaptureTargetRestoreRejectsAnyAdditionalPolicyChange(t *testing.T) {
 	}
 }
 
+func TestPrepareResumeReanchorsWithoutResettingEvidence(t *testing.T) {
+	original, err := New(testConfig(ModeShadow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := map[uint64]time.Duration{1: 60 * time.Second, 2: 28 * time.Second, 3: 28 * time.Second}
+	periods := map[uint64]time.Duration{1: 60 * time.Second, 2: 28 * time.Second, 3: 28 * time.Second}
+	protocols := map[uint64]string{1: "IDM", 2: "R900", 3: "R900"}
+	advanceScheduler(t, original, 0, 2*time.Hour, next, periods, protocols)
+	checkpoint, err := original.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := New(testConfig(ModeShadow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.RestoreState(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	restored.PrepareResume()
+	if len(restored.reanchorPending) != 3 {
+		t.Fatalf("pending reanchors=%d want=3", len(restored.reanchorPending))
+	}
+	reanchorAt := time.Duration(checkpoint.LastEndNS) + 13*time.Second
+	decision := restored.Advance(time.Duration(checkpoint.LastEndNS), reanchorAt)
+	if !decision.Decode || decision.Selected != "" {
+		t.Fatalf("resume was not fail-open before reanchor: %+v", decision)
+	}
+	for id := uint64(1); id <= 3; id++ {
+		restored.Observe(id, protocols[id], reanchorAt)
+	}
+	if len(restored.reanchorPending) != 0 {
+		t.Fatalf("pending reanchors=%d want=0", len(restored.reanchorPending))
+	}
+	reanchored, err := restored.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx, candidate := range reanchored.Candidates {
+		before := checkpoint.Candidates[idx]
+		for senderIdx, model := range candidate.Senders {
+			old := before.Senders[senderIdx]
+			if model.Events != old.Events || model.Misses != old.Misses || model.ChangePoints != old.ChangePoints || !reflect.DeepEqual(model.HistoryNS, old.HistoryNS) {
+				t.Fatalf("candidate %s sender %d changed evidence or history during reanchor", candidate.Name, model.ID)
+			}
+			if model.LastNS != int64(reanchorAt) || model.AnchorNS != int64(reanchorAt) || !model.Seen {
+				t.Fatalf("candidate %s sender %d was not reanchored", candidate.Name, model.ID)
+			}
+		}
+	}
+	for idx, sender := range reanchored.Senders {
+		if !reflect.DeepEqual(sender.GapsNS, checkpoint.Senders[idx].GapsNS) {
+			t.Fatalf("sender %d added process downtime to watchdog gaps", sender.ID)
+		}
+	}
+
+	r900At := reanchorAt + periods[2]
+	restored.Advance(reanchorAt, r900At)
+	restored.Observe(2, protocols[2], r900At)
+	restored.Observe(3, protocols[3], r900At)
+	idmAt := reanchorAt + periods[1]
+	restored.Advance(r900At, idmAt)
+	restored.Observe(1, protocols[1], idmAt)
+	continued, err := restored.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx, candidate := range continued.Candidates {
+		before := checkpoint.Candidates[idx]
+		for senderIdx, model := range candidate.Senders {
+			old := before.Senders[senderIdx]
+			if model.Events != old.Events+1 || model.Misses != old.Misses || model.ChangePoints != old.ChangePoints {
+				t.Fatalf("candidate %s sender %d did not continue cleanly after reanchor", candidate.Name, model.ID)
+			}
+		}
+	}
+}
+
 func TestRestoreStateRejectsCorruptionWithoutMutation(t *testing.T) {
 	scheduler, err := New(testConfig(ModeShadow))
 	if err != nil {

@@ -150,14 +150,17 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 	targetMigration := false
 	policyMigration := false
 	modeMigration := false
+	fullState := false
 	if report.Schema == "rtlamr-duty-scheduler-live-v3" || report.Schema == "rtlamr-duty-scheduler-live-v4" {
 		err := scheduler.RestoreState(report.SchedulerState)
 		switch {
 		case err == nil:
 			exact = true
+			fullState = true
 		case report.Mode == dutyscheduler.ModeShadow && d.mode == dutyscheduler.ModeGated:
 			if promotionErr := scheduler.RestoreShadowState(report.SchedulerState); promotionErr == nil {
 				modeMigration = true
+				fullState = true
 				break
 			}
 			if err := scheduler.RestoreLegacySnapshot(report.Snapshot); err != nil {
@@ -167,6 +170,7 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 		case errors.Is(err, dutyscheduler.ErrStateConfigurationMismatch) && report.Mode == d.mode && report.CaptureTarget != schedulerConfig.CaptureTarget:
 			if targetErr := scheduler.RestoreCaptureTargetState(report.SchedulerState, report.CaptureTarget); targetErr == nil {
 				targetMigration = true
+				fullState = true
 				break
 			}
 			if err := scheduler.RestoreLegacySnapshot(report.Snapshot); err != nil {
@@ -194,6 +198,9 @@ func (d *dutyRuntime) readCheckpoint(path string) (dutyCheckpointCandidate, erro
 	}
 	if (exact || targetMigration) && report.SampleRemainder != remainder {
 		return dutyCheckpointCandidate{}, errors.New("dutyscheduler: checkpoint sample remainder mismatch")
+	}
+	if fullState {
+		scheduler.PrepareResume()
 	}
 	sum := sha256.Sum256(contents)
 	return dutyCheckpointCandidate{

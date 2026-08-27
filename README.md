@@ -39,8 +39,11 @@ optional direct RTL-SDR input path when their runtime gates pass.
   policies resume deterministically. A capture-target-only change preserves
   independently learned cadence, watchdogs, and evidence after proving every
   other normalized configuration field is identical; qualification and its
-  stability timer always restart under the new target. Optional site-specific
-  seeds belong in a protected runtime policy file, never in the public binary.
+  stability timer always restart under the new target. Full-state resumes stay
+  fail-open until one live arrival from every previously seen sender reanchors
+  cadence phase; those arrivals are not scored as capture evidence, so process
+  downtime cannot masquerade as RF drift. Optional site-specific seeds belong
+  in a protected runtime policy file, never in the public binary.
 - The bundled collector has an opt-in 60-second change-or-heartbeat policy for
   R900 data. It emits field changes immediately while bounding unchanged
   heartbeat writes.
