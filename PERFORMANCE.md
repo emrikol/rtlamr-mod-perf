@@ -140,6 +140,20 @@ cadence relearning. Compatible shadow checkpoints may be promoted into gated
 mode without repeating the entire evidence run, but every promotion and gated
 restart begins with continuous-DSP recovery.
 
+The exact Clopper-Pearson bound is cached by each sender's evidence tuple
+(`events`, `misses`, and confidence alpha). Qualification timers and fail-open
+checks still run for every block, but unchanged evidence does not repeat the
+80-step numerical solver. A regression benchmark covering learned senders in
+the estimating state fell from about 8.9 microseconds to 0.29 microseconds per
+block on the development ARM64 system, with identical bounds and zero
+allocations. The cached path measured 1.70--1.72 microseconds per block on the
+reference Cortex-A72, or about 0.05% of one core at 288 blocks per second.
+
+Sender inventories are sorted before configuration is fingerprinted. Sender
+order has no policy meaning, so this prevents Go map iteration order from
+turning an unchanged restart into a false policy migration and unnecessary
+cadence relearning.
+
 Sender-specific watchdog values are operational data. The public default leaves
 static count/deadline thresholds disabled rather than compiling private cadence
 or endpoint identities into the binary. A protected JSON file selected with

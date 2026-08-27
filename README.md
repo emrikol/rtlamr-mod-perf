@@ -33,9 +33,11 @@ optional direct RTL-SDR input path when their runtime gates pass.
   targets remain configurable. Learned watchdogs, per-arrival obligations,
   adaptive history, and recoverable evidence epochs track drift after initial
   qualification. Versioned checkpoints can promote compatible shadow evidence
-  into gated mode while forcing continuous-DSP recovery first. Optional
-  site-specific seeds belong in a protected runtime policy file, never in the
-  public binary.
+  into gated mode while forcing continuous-DSP recovery first. Exact confidence
+  results are cached by evidence tuple, and sender configuration is
+  canonicalized so estimating-state block processing stays cheap and unchanged
+  policies resume deterministically. Optional site-specific seeds belong in a
+  protected runtime policy file, never in the public binary.
 - The bundled collector has an opt-in 60-second change-or-heartbeat policy for
   R900 data. It emits field changes immediately while bounding unchanged
   heartbeat writes.
