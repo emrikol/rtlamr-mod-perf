@@ -64,7 +64,7 @@ func NewParser(chipLength int) (p protocol.Parser) {
 
 func (p Parser) PacketBytesOnly() bool { return true }
 
-func (p Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
+func (p *Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
 	if p.seen == nil {
 		p.seen = make(map[[92]byte]struct{})
 	} else {
