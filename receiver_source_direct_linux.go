@@ -58,13 +58,18 @@ typedef struct rtlamr_direct {
 	int kernel_ring_fd;
 	unsigned char **kernel_mappings;
 	struct rtlamr_usb_ring_release *kernel_held;
+	struct rtlamr_usb_ring_release kernel_pending;
 	struct rtlamr_usb_ring_completion kernel_current;
+	int kernel_pending_valid;
 	int kernel_current_valid;
+	int kernel_exchange_supported;
 	uint32_t kernel_slot_count;
 	uint32_t kernel_retain_batches;
 	uint32_t kernel_held_head;
 	uint32_t kernel_held_count;
 } rtlamr_direct;
+
+static int rtlamr_direct_release(rtlamr_direct *source);
 
 static void *rtlamr_direct_read_thread(void *opaque) {
 	rtlamr_direct *source = (rtlamr_direct *)opaque;
@@ -165,7 +170,9 @@ static void rtlamr_direct_kernel_cleanup(rtlamr_direct *source) {
 	source->kernel_slot_count = 0;
 	source->kernel_held_head = 0;
 	source->kernel_held_count = 0;
+	source->kernel_pending_valid = 0;
 	source->kernel_current_valid = 0;
+	source->kernel_exchange_supported = 0;
 	if (source->kernel_ring_fd >= 0) {
 		(void)close(source->kernel_ring_fd);
 		source->kernel_ring_fd = -1;
@@ -233,6 +240,7 @@ static int rtlamr_direct_kernel_start(rtlamr_direct *source,
 		goto fail;
 	}
 	source->buffer_count = info.slot_count;
+	source->kernel_exchange_supported = 1;
 	source->started = 1;
 	return 0;
 
@@ -292,15 +300,62 @@ static int rtlamr_direct_start(rtlamr_direct *source, uint32_t buffer_count, uin
 	return 0;
 }
 
-static int rtlamr_direct_next(rtlamr_direct *source, unsigned char **data, uint32_t *length) {
+static int rtlamr_direct_release_descriptor(rtlamr_direct *source,
+		const struct rtlamr_usb_ring_release *release) {
+	int result;
+
+	do {
+		result = ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_RELEASE,
+			release);
+	} while (result != 0 && errno == EINTR);
+	return result == 0 ? 0 : -errno;
+}
+
+static int rtlamr_direct_next(rtlamr_direct *source, int release_previous,
+		unsigned char **data, uint32_t *length) {
 	if (source == NULL) {
 		return -EINVAL;
 	}
 	if (source->kernel_ring_active) {
+		struct rtlamr_usb_ring_exchange exchange;
 		ssize_t received;
+		int result;
 
-		if (source->kernel_current_valid) {
+		if (release_previous) {
+			result = rtlamr_direct_release(source);
+			if (result != 0) {
+				return result;
+			}
+		} else if (source->kernel_current_valid) {
 			return -EBUSY;
+		}
+		if (source->kernel_exchange_supported) {
+			memset(&exchange, 0, sizeof(exchange));
+			if (source->kernel_pending_valid) {
+				exchange.release_valid = 1;
+				exchange.release = source->kernel_pending;
+			}
+			do {
+				result = ioctl(source->kernel_ring_fd,
+					RTLAMR_USB_RING_IOC_EXCHANGE, &exchange);
+			} while (result != 0 && errno == EINTR);
+			if (result == 0) {
+				source->kernel_pending_valid = 0;
+				source->kernel_current = exchange.completion;
+				goto validate_completion;
+			}
+			if (errno != ENOTTY) {
+				return -errno;
+			}
+			source->kernel_exchange_supported = 0;
+			if (source->kernel_pending_valid) {
+				result = rtlamr_direct_release_descriptor(source,
+					&source->kernel_pending);
+				if (result != 0) {
+					return result;
+				}
+				source->kernel_pending_valid = 0;
+			}
 		}
 		do {
 			received = read(source->kernel_ring_fd, &source->kernel_current,
@@ -312,6 +367,7 @@ static int rtlamr_direct_next(rtlamr_direct *source, unsigned char **data, uint3
 		if ((size_t)received != sizeof(source->kernel_current)) {
 			return -EIO;
 		}
+	validate_completion:
 		if (source->kernel_current.slot >= source->kernel_slot_count ||
 				source->kernel_current.length != source->buffer_length) {
 			return -EPROTO;
@@ -361,18 +417,36 @@ static int rtlamr_direct_release(rtlamr_direct *source) {
 		current.slot = source->kernel_current.slot;
 		current.reserved = 0;
 		if (source->kernel_retain_batches == 0) {
-			if (ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_RELEASE,
-					&current) != 0) {
-				return -errno;
+			if (source->kernel_exchange_supported) {
+				if (source->kernel_pending_valid) {
+					return -EBUSY;
+				}
+				source->kernel_pending = current;
+				source->kernel_pending_valid = 1;
+			} else {
+				int result = rtlamr_direct_release_descriptor(source,
+					&current);
+				if (result != 0) {
+					return result;
+				}
 			}
 			source->kernel_current_valid = 0;
 			return 0;
 		}
 		if (source->kernel_held_count == source->kernel_retain_batches) {
 			oldest = &source->kernel_held[source->kernel_held_head];
-			if (ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_RELEASE,
-					oldest) != 0) {
-				return -errno;
+			if (source->kernel_exchange_supported) {
+				if (source->kernel_pending_valid) {
+					return -EBUSY;
+				}
+				source->kernel_pending = *oldest;
+				source->kernel_pending_valid = 1;
+			} else {
+				int result = rtlamr_direct_release_descriptor(source,
+					oldest);
+				if (result != 0) {
+					return result;
+				}
 			}
 			source->kernel_held_head = (source->kernel_held_head + 1) %
 					source->kernel_slot_count;
@@ -519,6 +593,8 @@ type directRTLSource struct {
 	state          *C.rtlamr_direct
 	blockBytes     int
 	batchActive    bool
+	kernelRing     bool
+	releasePending bool
 	deviceName     string
 	retainedBlocks int
 	cancelOnce     sync.Once
@@ -645,6 +721,7 @@ func newDirectRTLSource(config directRTLConfig) (receiverSource, uint32, uint32,
 		return fail("start RTL-SDR asynchronous reader", result)
 	}
 	if C.rtlamr_direct_kernel_active(state) != 0 {
+		source.kernelRing = true
 		source.retainedBlocks = int(config.RetainBatches) * int(config.BatchBytes/config.BlockBytes)
 	}
 	return source, uint32(tunerType), uint32(gainCount), nil
@@ -665,10 +742,11 @@ func (source *directRTLSource) Next() ([]byte, error) {
 	}
 	var data *C.uchar
 	var length C.uint32_t
-	result := C.rtlamr_direct_next(source.state, &data, &length)
+	result := C.rtlamr_direct_next(source.state, directRTLBool(source.releasePending), &data, &length)
 	if result < 0 {
 		return nil, directRTLError("read RTL-SDR batch", result)
 	}
+	source.releasePending = false
 	batchBytes := int(length)
 	if data == nil || batchBytes == 0 || batchBytes%source.blockBytes != 0 {
 		_ = C.rtlamr_direct_release(source.state)
@@ -681,6 +759,11 @@ func (source *directRTLSource) Next() ([]byte, error) {
 func (source *directRTLSource) Release() error {
 	if !source.batchActive {
 		return fmt.Errorf("no active direct RTL-SDR batch")
+	}
+	if source.kernelRing {
+		source.releasePending = true
+		source.batchActive = false
+		return nil
 	}
 	if result := C.rtlamr_direct_release(source.state); result < 0 {
 		return directRTLError("release RTL-SDR ring batch", result)
