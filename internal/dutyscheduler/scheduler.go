@@ -176,6 +176,7 @@ type senderModel struct {
 type candidate struct {
 	cfg              CandidateConfig
 	senders          map[uint64]*senderModel
+	senderList       []*senderModel
 	lastEligible     bool
 	lastAwake        bool
 	totalDuration    time.Duration
@@ -223,6 +224,7 @@ type Scheduler struct {
 	cfg              Config
 	candidates       []*candidate
 	senders          map[uint64]*senderRuntime
+	senderList       []*senderRuntime
 	selected         *candidate
 	lastEnd          time.Duration
 	started          bool
@@ -275,6 +277,7 @@ func New(cfg Config) (*Scheduler, error) {
 	s := &Scheduler{
 		cfg:             cfg,
 		senders:         make(map[uint64]*senderRuntime, len(cfg.Senders)),
+		senderList:      make([]*senderRuntime, 0, len(cfg.Senders)),
 		protocols:       make(map[string]*protocolRuntime),
 		reanchorPending: make(map[uint64]bool),
 		rng:             cfg.RandomSeed,
@@ -292,17 +295,25 @@ func New(cfg Config) (*Scheduler, error) {
 		if _, exists := s.senders[senderCfg.ID]; exists {
 			return nil, errors.New("dutyscheduler: duplicate sender")
 		}
-		s.senders[senderCfg.ID] = &senderRuntime{cfg: senderCfg}
+		sender := &senderRuntime{cfg: senderCfg}
+		s.senders[senderCfg.ID] = sender
+		s.senderList = append(s.senderList, sender)
 	}
 	for _, candidateCfg := range cfg.Candidates {
 		if err := validateCandidate(candidateCfg, cfg.MinimumAudit); err != nil {
 			return nil, err
 		}
-		c := &candidate{cfg: candidateCfg, senders: make(map[uint64]*senderModel, len(cfg.Senders))}
+		c := &candidate{
+			cfg:        candidateCfg,
+			senders:    make(map[uint64]*senderModel, len(cfg.Senders)),
+			senderList: make([]*senderModel, 0, len(cfg.Senders)),
+		}
 		c.wakeScale = 1
 		c.epoch = 1
 		for _, senderCfg := range cfg.Senders {
-			c.senders[senderCfg.ID] = &senderModel{}
+			model := &senderModel{}
+			c.senders[senderCfg.ID] = model
+			c.senderList = append(c.senderList, model)
 		}
 		s.candidates = append(s.candidates, c)
 	}
@@ -483,8 +494,8 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 func (s *Scheduler) resetLearning() {
 	s.discontinuities++
 	for _, c := range s.candidates {
-		for id := range c.senders {
-			c.senders[id] = &senderModel{}
+		for _, sender := range c.senderList {
+			*sender = senderModel{}
 		}
 		c.lastEligible = false
 		c.lastAwake = true
@@ -497,7 +508,7 @@ func (s *Scheduler) resetLearning() {
 		c.recoveryUntil = 0
 		c.wakeScale = 1
 	}
-	for _, sender := range s.senders {
+	for _, sender := range s.senderList {
 		sender.protocol = ""
 		sender.lastSeen = 0
 		sender.seen = false
@@ -536,9 +547,9 @@ func (s *Scheduler) ObserveEscape(id uint64, protocol string, at time.Duration) 
 // capture evidence.
 func (s *Scheduler) PrepareResume() {
 	clear(s.reanchorPending)
-	for id, sender := range s.senders {
+	for _, sender := range s.senderList {
 		if sender.seen {
-			s.reanchorPending[id] = true
+			s.reanchorPending[sender.cfg.ID] = true
 		}
 	}
 	s.selected = nil
@@ -756,7 +767,7 @@ func (c *candidate) beginNewEpoch(now time.Duration, widen bool) {
 			c.wakeScale = c.cfg.MaxWakeScale
 		}
 	}
-	for _, sender := range c.senders {
+	for _, sender := range c.senderList {
 		sender.events = 0
 		sender.misses = 0
 		if widen && sender.learned {
@@ -777,7 +788,7 @@ func (c *candidate) tightenAfterRefresh(now time.Duration) {
 		c.wakeScale = 1
 	}
 	ratio := c.wakeScale / oldScale
-	for _, sender := range c.senders {
+	for _, sender := range c.senderList {
 		if sender.learned {
 			sender.preWake = scaleDuration(sender.preWake, ratio)
 			sender.postWake = scaleDuration(sender.postWake, ratio)
@@ -794,7 +805,7 @@ func scaleDuration(value time.Duration, scale float64) time.Duration {
 }
 
 func (c *candidate) allLearned() bool {
-	for _, sender := range c.senders {
+	for _, sender := range c.senderList {
 		if !sender.learned {
 			return false
 		}
@@ -803,7 +814,7 @@ func (c *candidate) allLearned() bool {
 }
 
 func (c *candidate) awakeDuring(start, end time.Duration) bool {
-	for _, sender := range c.senders {
+	for _, sender := range c.senderList {
 		if sender.awakeDuring(start, end) {
 			return true
 		}
@@ -937,7 +948,7 @@ func (s *Scheduler) effectiveMinimumCount(sender *senderRuntime) int {
 }
 
 func (s *Scheduler) watchdogsReady() bool {
-	for _, sender := range s.senders {
+	for _, sender := range s.senderList {
 		seeded := sender.cfg.Overdue > 0 && sender.cfg.CountWindow > 0 && sender.cfg.MinimumCount > 0
 		if !seeded && !sender.watchdogLearned {
 			return false
@@ -948,7 +959,7 @@ func (s *Scheduler) watchdogsReady() bool {
 
 func (s *Scheduler) checkWatchdogs(now time.Duration) {
 	failed := false
-	for _, sender := range s.senders {
+	for _, sender := range s.senderList {
 		overdue := s.effectiveOverdue(sender)
 		if sender.seen && sender.obligationOpen && overdue > 0 && now >= sender.obligationDue {
 			if !sender.overdueOpen {
@@ -1041,7 +1052,7 @@ func (s *Scheduler) qualifiesAt(c *candidate, target float64) bool {
 	}
 	maxMiss := 1 - target
 	alpha := 1 - s.cfg.Confidence
-	for _, sender := range c.senders {
+	for _, sender := range c.senderList {
 		if sender.events == 0 || sender.confidenceUpperBound(alpha) > maxMiss {
 			return false
 		}
