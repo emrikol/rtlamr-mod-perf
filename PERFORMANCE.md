@@ -99,11 +99,13 @@ The matching profile no longer contained the former bulk `copy_to_user` or
 duty-collar `memmove`. Fused DSP was the largest leaf at 36.01% of sampled
 cycles. The kernel-ring descriptor read was 0.12%; ARM64 DMA cache invalidation
 was 0.87%. The remaining 0.27% `runtime.memmove` belonged to decoder result
-assembly rather than IQ transport. Persistent DMA mapping would still require
-a device-to-CPU cache-ownership synchronization before cacheable userspace
-reads, but can avoid mapping and unmapping the same preallocated slot on every
-reuse. That follow-up remains hardware-qualified work; no speculative kernel
-SIMD or custom copy loop is retained.
+assembly rather than IQ transport. Persistent DMA mapping still requires a
+device-to-CPU cache-ownership synchronization before cacheable userspace
+reads. A follow-up combined persistent mappings with prospective kernel DSP
+sleep plans, but the live fail-open gate found that the first long skip stopped
+returning completion descriptors beyond the bounded plan horizon. The candidate
+was reverted before CPU rows were retained. The simpler mapped ring remains the
+accepted design; no speculative kernel SIMD or custom copy loop is retained.
 
 The feature is selected with `-directkernelring`. Missing modules, device
 nodes, ABI/geometry mismatches, and unsupported builds continue through the
@@ -143,9 +145,9 @@ same ordered output and DSP inventory while reducing modeled userspace
 handoffs by 10.17--10.53% at the cost of 0.66--1.06% more whole-batch
 synchronization bytes. The exact-collar 464 KiB geometry instead saved only
 0.16--1.43% synchronization bytes and increased handoffs by 8.77--10.17%.
-These are structural replay results, not measured CPU gains; 576 KiB is only an
-offline implementation candidate until a counterbalanced hardware test confirms
-the tradeoff.
+These are structural replay results, not measured CPU gains. The subsequent
+hardware gate rejected the 576 KiB persistent-DMA/plan candidate on streaming
+liveness before counterbalanced CPU rows were retained.
 
 ## Modeled energy implications
 
@@ -381,7 +383,9 @@ Several ideas were measured and intentionally left out of the public runtime:
 
 - extra asynchronous decoder queues and multi-core fan-out, where handoff,
   scheduling, and cache costs outweighed useful work;
-- persistent-DMA layouts beyond the four-slot ownership ring;
+- persistent-DMA layouts beyond the four-slot ownership ring, including a
+  prospective kernel sleep-plan variant that failed its bounded-wake liveness
+  gate before performance timing;
 - GPU/V3D offload for the current small streaming kernels, where submission and
   synchronization dominated;
 - narrower receiver/channelization schemes that could not preserve the full RF
