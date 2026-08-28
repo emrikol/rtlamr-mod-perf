@@ -396,15 +396,12 @@ static int rtlamr_direct_release(rtlamr_direct *source) {
 	source->consumer = (source->consumer + 1) % source->buffer_count;
 	pthread_cond_broadcast(&source->condition);
 	pthread_mutex_unlock(&source->mutex);
-	if (source->kernel_ring_active && source->kernel_ring_fd >= 0 &&
-			ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_STOP) != 0 &&
-			errno != ENODEV) {
-		return -errno;
-	}
 	return 0;
 }
 
 static int rtlamr_direct_cancel(rtlamr_direct *source) {
+	int result = 0;
+
 	if (source == NULL) {
 		return 0;
 	}
@@ -412,7 +409,38 @@ static int rtlamr_direct_cancel(rtlamr_direct *source) {
 	source->stopping = 1;
 	pthread_cond_broadcast(&source->condition);
 	pthread_mutex_unlock(&source->mutex);
-	return 0;
+	if (source->kernel_ring_active && source->kernel_ring_fd >= 0 &&
+			ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_STOP) != 0 &&
+			errno != ENODEV) {
+		result = -errno;
+	}
+	return result;
+}
+
+// rtlamr_direct_test_cancel_fd exercises the production cancellation function
+// without opening an SDR. A non-ring descriptor makes the STOP ioctl fail with
+// ENOTTY, which lets the Go regression test prove whether cancellation actually
+// attempted to interrupt a kernel-ring read.
+static int rtlamr_direct_test_cancel_fd(int fd, int kernel_ring_active) {
+	rtlamr_direct source;
+	int result;
+
+	memset(&source, 0, sizeof(source));
+	source.kernel_ring_fd = fd;
+	source.kernel_ring_active = kernel_ring_active;
+	result = pthread_mutex_init(&source.mutex, NULL);
+	if (result != 0) {
+		return -result;
+	}
+	result = pthread_cond_init(&source.condition, NULL);
+	if (result != 0) {
+		pthread_mutex_destroy(&source.mutex);
+		return -result;
+	}
+	result = rtlamr_direct_cancel(&source);
+	pthread_cond_destroy(&source.condition);
+	pthread_mutex_destroy(&source.mutex);
+	return result;
 }
 
 static int rtlamr_direct_close(rtlamr_direct *source) {
@@ -666,6 +694,10 @@ func (source *directRTLSource) Cancel() error {
 		source.cancelErr = directRTLError("cancel RTL-SDR reader", C.rtlamr_direct_cancel(source.state))
 	})
 	return source.cancelErr
+}
+
+func directRTLCancelFDForTest(fd uintptr, kernelRingActive bool) int {
+	return int(C.rtlamr_direct_test_cancel_fd(C.int(fd), directRTLBool(kernelRingActive)))
 }
 
 func (source *directRTLSource) Close() error {
