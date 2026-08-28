@@ -310,7 +310,7 @@ func (d *Decoder) decodeQuantized() (messages []Message) {
 // and byte-only parsers to skip bit-string construction. Parser order remains
 // unchanged; a shared packet projection is materialized lazily at most once
 // per preamble.
-func (d Decoder) parseCandidates(indices []int, parsers []Parser, messages []Message) []Message {
+func (d *Decoder) parseCandidates(indices []int, parsers []Parser, messages []Message) []Message {
 	var packets []Data
 	materialized := false
 	includeBits := false

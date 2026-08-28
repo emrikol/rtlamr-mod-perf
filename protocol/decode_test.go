@@ -253,7 +253,8 @@ func TestParseCandidatesIndexOnlyDoesNotMaterializePackets(t *testing.T) {
 	indices := []int{17, 42}
 	var received []int
 	parser := &decoderIndexTestParser{id: 1, received: &received}
-	messages := (Decoder{}).parseCandidates(indices, []Parser{parser}, nil)
+	decoder := Decoder{}
+	messages := decoder.parseCandidates(indices, []Parser{parser}, nil)
 	if len(messages) != 1 || messages[0].MeterID() != 1 {
 		t.Fatalf("messages = %v, want one message from parser 1", messages)
 	}
