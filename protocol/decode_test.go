@@ -263,6 +263,44 @@ func TestParseCandidatesIndexOnlyDoesNotMaterializePackets(t *testing.T) {
 	}
 }
 
+func TestPacketBytesAtMatchesLogicalRingOracle(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x5041434b4554))
+	for iteration := 0; iteration < 500; iteration++ {
+		blockSize := 8 + rng.Intn(249)
+		packetSymbols := 1 + rng.Intn(200)
+		symbolLength := 1 + rng.Intn(16)
+		ringLength := blockSize + packetSymbols*symbolLength + 17
+		decoder := Decoder{
+			Cfg: PacketConfig{
+				BlockSize:     blockSize,
+				PacketSymbols: packetSymbols,
+				SymbolLength:  symbolLength,
+			},
+			Quantized:      make([]byte, ringLength),
+			quantizedStart: rng.Intn(ringLength - blockSize),
+			pkt:            make([]byte, (packetSymbols+7)>>3),
+		}
+		for index := range decoder.Quantized {
+			decoder.Quantized[index] = byte(rng.Intn(2))
+		}
+		candidate := rng.Intn(blockSize + 1)
+		got := make([]byte, len(decoder.pkt))
+		rng.Read(got)
+		want := append([]byte(nil), got...)
+		for symbol := 0; symbol < packetSymbols; symbol++ {
+			packetByte := symbol >> 3
+			physical := (decoder.quantizedStart + candidate + symbol*symbolLength) % ringLength
+			want[packetByte] = want[packetByte]<<1 | decoder.Quantized[physical]
+		}
+		if !decoder.PacketBytesAt(candidate, got) {
+			t.Fatalf("iteration %d rejected valid candidate", iteration)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("iteration %d projection mismatch: got %x want %x", iteration, got, want)
+		}
+	}
+}
+
 func TestParseCandidatesOmitsBitsForBytesOnlyParsers(t *testing.T) {
 	decoder := newParserOrderTestDecoder()
 	var received []Data
