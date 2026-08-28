@@ -113,22 +113,39 @@ ownership contract.
 
 ### Offline ring candidate bank
 
-`offline_ring_bank_test.go` provides an opt-in corpus harness for screening
+`offline_ring_bank_test.go` provides opt-in corpus harnesses for screening
 transport geometry and actuator placement without touching a radio or loading a
-kernel module. It sweeps 256 KiB, 512 KiB, and 1 MiB batches; per-block,
-per-batch, and modeled kernel-plan actuation; and several wake widths. Every
-candidate is checked against the complete decoder's ordered message digests and
-the production recovery-collar path.
+kernel module. The first bank sweeps 256 KiB, 512 KiB, and 1 MiB batches;
+per-block, per-batch, and modeled kernel-plan actuation; and several wake
+widths. The collar-knee bank adds geometries around the decoder's exact recovery
+collar and reports whole-batch synchronization volume, collar slack, ring
+headroom, and modeled 64 KiB xHCI boundary spans. Every candidate is checked
+against the complete decoder's ordered message digests and the production
+recovery-collar path.
 
 ```sh
 RTLAMR_OFFLINE_BANK_CORPUS=/path/to/block-aligned.iq \
   go test -run TestOfflineKernelRingCandidateBank -count=1 -v .
+
+RTLAMR_OFFLINE_BANK_CORPUS=/path/to/block-aligned.iq \
+  RTLAMR_OFFLINE_BANK_RESULTS=/path/to/results.ndjson \
+  go test -run TestOfflineKernelRingCollarKneeCandidateBank -count=1 -v .
 ```
 
 Results are emitted as `OFFLINE_RING_BANK` JSON records. Local replay can reject
 semantic or collar failures and compare DSP-block and handoff inventories. It
 does not rank DMA cacheability, xHCI, IRQ, or coherent-memory performance;
 those remain exact-hardware measurements.
+
+On two anonymized short corpora, the collar-knee bank promoted a 576 KiB
+geometry over the 512 KiB reference for a hardware screen. It preserved the
+same ordered output and DSP inventory while reducing modeled userspace
+handoffs by 10.17--10.53% at the cost of 0.66--1.06% more whole-batch
+synchronization bytes. The exact-collar 464 KiB geometry instead saved only
+0.16--1.43% synchronization bytes and increased handoffs by 8.77--10.17%.
+These are structural replay results, not measured CPU gains; 576 KiB is only an
+offline implementation candidate until a counterbalanced hardware test confirms
+the tradeoff.
 
 ## Modeled energy implications
 
