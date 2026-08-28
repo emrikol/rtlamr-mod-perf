@@ -35,8 +35,13 @@ optional direct RTL-SDR input path when their runtime gates pass.
   pages for recovery. This removes about **9.0 MiB/s** of payload-copy traffic
   at the reference sample rate. An anonymized five-minute live comparison used
   **7.98% less rtlamr CPU** than the already optimized direct-input + gated-DSP
-  baseline. TCP remains the default, and the optional module fails open to the
-  ordinary direct path.
+  baseline. A later release-before-wait exchange removed one syscall and cgo
+  transition per batch, reducing complete-process task-clock by another
+  **4.59%**. Persistent DMA mappings plus a measured 36-block/576 KiB geometry
+  then reduced task-clock **8.26%** and context switches **23.9%** relative to
+  that immediate control. These are sequential stages, not additive claims.
+  TCP remains the default, and the optional module fails open to the ordinary
+  direct path.
 - On the reference low-throughput direct-SDR pipeline, setting Go's standard
   `GOMAXPROCS=1` reduced median decoder-process CPU by **37.0%** in an
   eight-row counterbalanced screen. It cut scheduler wakeups and migrations
@@ -179,9 +184,11 @@ Linux users may additionally build the optional
 `-directkernelring`. It maps kernel-owned USB payload pages directly into the
 decoder and fails open to the ordinary direct source when the optional path is
 unavailable. The module must match the running kernel; see its README for build
-and device-permission details. Ring cancellation and repeated usbfs/kernel
-handoffs are deterministic: shutdown stops blocked ring reads, and each START
-re-establishes the SDR interface before submitting URBs.
+and device-permission details. `-directkernelbatchblocks` selects the kernel
+batch geometry and must match the module's `slot_bytes`; its default preserves
+the 16-block layout. Ring cancellation and repeated usbfs/kernel handoffs are
+deterministic: shutdown stops blocked ring reads, and each START re-establishes
+the SDR interface before submitting URBs.
 
 ## Message Types
 

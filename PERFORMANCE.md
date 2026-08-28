@@ -142,13 +142,41 @@ The matching profile no longer contained the former bulk `copy_to_user` or
 duty-collar `memmove`. Fused DSP was the largest leaf at 36.01% of sampled
 cycles. The kernel-ring descriptor read was 0.12%; ARM64 DMA cache invalidation
 was 0.87%. The remaining 0.27% `runtime.memmove` belonged to decoder result
-assembly rather than IQ transport. Persistent DMA mapping still requires a
-device-to-CPU cache-ownership synchronization before cacheable userspace
-reads. A follow-up combined persistent mappings with prospective kernel DSP
-sleep plans, but the live fail-open gate found that the first long skip stopped
-returning completion descriptors beyond the bounded plan horizon. The candidate
-was reverted before CPU rows were retained. The simpler mapped ring remains the
-accepted design; no speculative kernel SIMD or custom copy loop is retained.
+assembly rather than IQ transport. Persistent DMA mapping still requires both
+device-to-CPU and CPU-to-device cache-ownership transitions for cacheable
+userspace reads. Coherent/uncached USB buffers were screened earlier and made
+the downstream decoder reads substantially slower, so the retained path keeps
+ordinary cacheable pages. No speculative kernel SIMD or custom copy loop is
+retained.
+
+The accepted ABI-v2 steady path releases the previous slot before waiting for
+the next completion, combining two ownership calls into one blocking exchange.
+Go invokes that ioctl directly, while cgo remains outside the steady loop for
+device discovery and tuner setup. The decoder also reuses prevalidated decoder
+configuration on duty wake, and the scheduler maintains indexed watchdog and
+transition state instead of rebuilding it on every block. A counterbalanced
+whole-process confirmation measured **4.59% less task-clock**, **4.72% fewer
+cycles**, and **2.94% fewer instructions** than the preceding mapped-ring
+release. Completion-descriptor `read` calls fell from 2,160 to zero over each
+fixed comparison window.
+
+A subsequent isolated factorial varied persistent DMA ownership and batch
+geometry. The accepted combination maps each slot once for its lifetime and
+uses seven 36-block/576 KiB slots, retaining one completed batch for the
+29-block duty-recovery collar. Against the immediate ABI-v2 control, a
+counterbalanced confirmation measured **8.26% less task-clock**, **10.09%
+fewer cycles**, and **23.90% fewer context switches**; ownership ioctls fell
+from 2,160 to 960 per fixed window (**55.6%**). Retired instructions were
+effectively flat (+0.25%), consistent with removing wake/cache-ownership
+overhead rather than changing DSP work.
+
+An attached profile of that exact configuration measured 1.466% of one CPU
+core with no lost samples, restart, ring error, or throttle event. Fused DSP
+was 72.46% self cycles. The largest remaining non-DSP stacks were the complete
+USB exchange at 6.87% inclusive and duty-scheduler advancement at 2.01%
+inclusive; `memmove`, map clearing, and wall-clock reads were each below 1%.
+These profile shares describe the small remaining process and must not be read
+as percentages of a whole core.
 
 The feature is selected with `-directkernelring`. Missing modules, device
 nodes, ABI/geometry mismatches, and unsupported builds continue through the
@@ -201,26 +229,27 @@ same ordered output and DSP inventory while reducing modeled userspace
 handoffs by 10.17--10.53% at the cost of 0.66--1.06% more whole-batch
 synchronization bytes. The exact-collar 464 KiB geometry instead saved only
 0.16--1.43% synchronization bytes and increased handoffs by 8.77--10.17%.
-These are structural replay results, not measured CPU gains. The subsequent
-hardware gate rejected the 576 KiB persistent-DMA/plan candidate on streaming
-liveness before counterbalanced CPU rows were retained.
+These were structural replay results, not measured CPU gains. An earlier
+candidate bundled the geometry with a prospective kernel sleep plan and failed
+its streaming-liveness gate. Removing that unrelated plan allowed the geometry
+and persistent mapping to be measured independently; the corrected combination
+is the accepted configuration described above.
 
 ### Rejected non-DSP follow-ups
 
-An additive ABI-compatible ring exchange candidate fused descriptor release and
-the next blocking claim into one ioctl, with automatic fallback to the legacy
-ABI. A direct IDM candidate-parser path separately avoided packet
-materialization and improved fixed replay by 0.659% with identical messages.
-The combined candidate reduced live CPU, but most of that gain came from the
-independently proven single-P runtime setting. Its frozen candidate-only live
-gate observed only two of three anonymized sender classes before the fixed
-deadline. Both code candidates were therefore reverted and are not included in
-the retained release.
+The first ring-exchange prototype waited for the next completion before
+releasing the previous slot. It was reverted because that ordering reduced
+active queue depth and could deadlock at the ownership boundary. The retained
+ABI-v2 implementation reverses the order and has a deterministic wakeup
+regression for its committed, uninterruptible wait.
 
-A duty-scheduler binary-search/clock-hoisting candidate improved fixed replay
-by only 0.22%, inside the control spread, and was also reverted. These terminal
-results keep the current release focused on changes whose complete-boundary
-benefit and live semantics both cleared their predeclared gates.
+A direct IDM candidate-parser path separately avoided packet materialization
+and improved fixed replay by 0.659% with identical messages, but its live gate
+did not observe every anonymized sender class before the frozen deadline; it
+remains reverted. A duty-scheduler binary-search/clock-hoisting candidate
+improved fixed replay by only 0.22%, inside the control spread, and was also
+reverted. The later indexed-deadline scheduler work is distinct: it preserved
+the complete state oracle and cleared its isolated benchmark gate.
 
 ## Modeled energy implications
 

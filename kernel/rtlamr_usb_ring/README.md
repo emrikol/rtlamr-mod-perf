@@ -31,6 +31,12 @@ sudo insmod kernel/rtlamr_usb_ring/rtlamr_usb_ring.ko \
   ring_slots=16 slot_bytes=262144
 ```
 
+`slot_bytes` must equal the decoder block size multiplied by rtlamr's
+`-directkernelbatchblocks` value. The default is 16 blocks. Larger batches
+reduce ownership crossings but increase cache-synchronization volume and
+latency, so they should be selected from whole-process measurements rather
+than assumed to be universally faster.
+
 Grant the rtlamr process read access to `/dev/rtlamr_usb_ring0`, then build the
 direct backend and opt in:
 
@@ -49,13 +55,16 @@ the service account.
 
 ## Data path
 
-- Ordinary cacheable pages are allocated once during USB probe.
+- Ordinary cacheable pages are allocated and DMA-mapped once during USB probe.
 - URBs and slot metadata are allocated once; the steady path allocates no IQ
   payload storage.
-- USB core performs the architecture-correct DMA mapping and cache ownership
-  transition for each reuse.
-- Userspace receives only a 24-byte completion descriptor and returns a
-  16-byte release descriptor.
+- The driver performs the architecture-correct CPU/device ownership sync at
+  each handoff without unmapping and remapping the payload.
+- ABI v2 combines the previous slot's release with the next blocking claim in
+  one ioctl. Release and resubmission happen before the wait, preserving queue
+  depth and avoiding an empty-ring dependency.
+- Userspace exchanges only fixed-size ownership descriptors; payload bytes
+  remain in the mapped ring.
 - Slots are released in sequence and cannot be submitted again while the
   decoder or recovery collar may still reference their bytes.
 - Cancellation sends STOP before waiting for the blocked reader. STOP wakes
