@@ -25,6 +25,13 @@ optional direct RTL-SDR input path when their runtime gates pass.
   bounded screen measured **31.9% less process CPU** than the prior direct-copy
   control; more elaborate asynchronous and persistent-DMA variants lost and
   were rejected.
+- An optional Linux kernel-owned ring goes one step further: USB DMA pages are
+  mapped read-only into the decoder, and the duty scheduler borrows those same
+  pages for recovery. This removes about **9.0 MiB/s** of payload-copy traffic
+  at the reference sample rate. An anonymized five-minute live comparison used
+  **7.98% less rtlamr CPU** than the already optimized direct-input + gated-DSP
+  baseline. TCP remains the default, and the optional module fails open to the
+  ordinary direct path.
 - An opt-in self-learning DSP duty scheduler provides safe-seed, shadow,
   gated, audit, periodic full-refresh, and fail-open recovery behavior. It will
   not skip DSP until every configured sender independently clears the selected
@@ -153,6 +160,13 @@ sudo ./rtlamr -source=direct -device=0
 
 The ordinary build and the default `-source=tcp` behavior remain unchanged.
 `-device` accepts either an RTL-SDR device index or USB serial number.
+
+Linux users may additionally build the optional
+[`rtlamr_usb_ring`](kernel/rtlamr_usb_ring) module and pass
+`-directkernelring`. It maps kernel-owned USB payload pages directly into the
+decoder and fails open to the ordinary direct source when the optional path is
+unavailable. The module must match the running kernel; see its README for build
+and device-permission details.
 
 ## Message Types
 

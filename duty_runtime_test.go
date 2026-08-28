@@ -70,7 +70,8 @@ func TestDutyCollarOwnsBytesAndPreservesWrappedOrder(t *testing.T) {
 		for offset := range block {
 			block[offset] = byte(idx)
 		}
-		start, end, decision := runtime.beginBlock()
+		start, end, _ := runtime.beginBlock()
+		decision := dutyscheduler.Decision{Decode: false}
 		runtime.finishBlock(block, start, end, time.Unix(int64(idx), 0), decision)
 		block[0] ^= 0xff
 	}
@@ -83,6 +84,97 @@ func TestDutyCollarOwnsBytesAndPreservesWrappedOrder(t *testing.T) {
 		want := byte(first + idx)
 		if !bytes.Equal(entry.data, bytes.Repeat([]byte{want}, runtime.blockBytes)) {
 			t.Fatalf("collar entry %d does not own ordered source bytes", idx)
+		}
+	}
+}
+
+func TestDutyCollarDoesNotCopyDecodedRawIQ(t *testing.T) {
+	runtime, err := newDutyRuntime("shadow", dutyTestConfig(), []uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := bytes.Repeat([]byte{0xa5}, runtime.blockBytes)
+	start, end, _ := runtime.beginBlock()
+	runtime.finishBlock(block, start, end, time.Time{}, dutyscheduler.Decision{Decode: true})
+	entry := runtime.orderedCollar()[0]
+	if entry.rawValid {
+		t.Fatal("decoded collar entry retained raw IQ")
+	}
+	if !bytes.Equal(entry.data, make([]byte, runtime.blockBytes)) {
+		t.Fatal("decoded collar entry copied source bytes")
+	}
+}
+
+func TestDutyBorrowedCollarAliasesSkippedRingStorage(t *testing.T) {
+	runtime, err := newDutyRuntime("gated", dutyTestConfig(), []uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.useBorrowedCollar(len(runtime.collar) - 1); err == nil {
+		t.Fatal("undersized retained source enabled borrowed collar")
+	}
+	if runtime.borrowRaw {
+		t.Fatal("failed borrowed-collar configuration changed runtime mode")
+	}
+	if err := runtime.useBorrowedCollar(len(runtime.collar)); err != nil {
+		t.Fatal(err)
+	}
+
+	count := len(runtime.collar) + 7
+	blocks := make([][]byte, count)
+	for idx := 0; idx < count; idx++ {
+		blocks[idx] = bytes.Repeat([]byte{byte(idx)}, runtime.blockBytes)
+		start, end, _ := runtime.beginBlock()
+		runtime.finishBlock(blocks[idx], start, end, time.Unix(int64(idx), 0), dutyscheduler.Decision{Decode: false})
+	}
+	ordered := runtime.orderedCollar()
+	first := count - len(runtime.collar)
+	for idx, entry := range ordered {
+		want := byte(first + idx)
+		if len(entry.data) != runtime.blockBytes || &entry.data[0] != &blocks[first+idx][0] {
+			t.Fatalf("collar entry %d does not borrow its source ring block", idx)
+		}
+		if entry.data[0] != want || !entry.rawValid || entry.decoded {
+			t.Fatalf("collar entry %d metadata/data mismatch", idx)
+		}
+	}
+	blocks[first][0] ^= 0xff
+	if ordered[0].data[0] != blocks[first][0] {
+		t.Fatal("borrowed collar unexpectedly copied source bytes")
+	}
+
+	decoded := bytes.Repeat([]byte{0xa5}, runtime.blockBytes)
+	start, end, _ := runtime.beginBlock()
+	runtime.finishBlock(decoded, start, end, time.Time{}, dutyscheduler.Decision{Decode: true})
+	latest := runtime.orderedCollar()[len(runtime.collar)-1]
+	if latest.rawValid || latest.data != nil {
+		t.Fatal("borrowed collar retained a decoded block")
+	}
+}
+
+func TestDutyFullSkippedCollarContainsOnlyReplayableRawIQ(t *testing.T) {
+	runtime, err := newDutyRuntime("gated", dutyTestConfig(), []uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.useBorrowedCollar(len(runtime.collar)); err != nil {
+		t.Fatal(err)
+	}
+
+	decoded := make([]byte, runtime.blockBytes)
+	start, end, _ := runtime.beginBlock()
+	runtime.finishBlock(decoded, start, end, time.Time{}, dutyscheduler.Decision{Decode: true})
+	for idx := range runtime.collar {
+		block := bytes.Repeat([]byte{byte(idx + 1)}, runtime.blockBytes)
+		start, end, _ = runtime.beginBlock()
+		runtime.finishBlock(block, start, end, time.Time{}, dutyscheduler.Decision{Decode: false})
+	}
+	if runtime.skippedRun != len(runtime.collar) {
+		t.Fatalf("skipped run=%d, want %d", runtime.skippedRun, len(runtime.collar))
+	}
+	for idx, entry := range runtime.orderedCollar() {
+		if !entry.rawValid || entry.decoded || len(entry.data) != runtime.blockBytes {
+			t.Fatalf("full skipped collar entry %d is not replayable", idx)
 		}
 	}
 }

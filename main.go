@@ -237,6 +237,10 @@ func (rcvr *Receiver) NewReceiver() {
 			slog.Error("direct RTL-SDR source is unavailable in this build")
 			os.Exit(1)
 		}
+		retainBatches := 0
+		if *directKernelRing && *dutySchedulerMode == "gated" {
+			retainBatches = (dutyCollarBlockCount(cfg) + receiverReadBlocks - 1) / receiverReadBlocks
+		}
 		directConfig := directRTLConfig{
 			Device:            *directDevice,
 			CenterFreq:        cfg.CenterFreq,
@@ -263,6 +267,8 @@ func (rcvr *Receiver) NewReceiver() {
 			RTLXtalFreq:       uint32(rcvr.Flags.RtlXtalFreq),
 			TunerXtalFreqSet:  visited["tunerxtalfreq"],
 			TunerXtalFreq:     uint32(rcvr.Flags.TunerXtalFreq),
+			KernelRing:        *directKernelRing,
+			RetainBatches:     uint32(retainBatches),
 		}
 		var tunerType, gainCount uint32
 		rcvr.source, tunerType, gainCount, rcvr.err = newDirectRTLSource(directConfig)
@@ -296,6 +302,12 @@ func (rcvr *Receiver) NewReceiver() {
 		if *dutySchedulerCheckpointDir != "" {
 			if rcvr.err = rcvr.duty.configureCheckpoints(*dutySchedulerCheckpointDir, time.Hour); rcvr.err != nil {
 				slog.Error("configure DSP duty scheduler checkpoints", "error", rcvr.err)
+				os.Exit(1)
+			}
+		}
+		if retained, ok := rcvr.source.(retainedInputSource); ok && retained.RetainedInputBlocks() > 0 {
+			if rcvr.err = rcvr.duty.useBorrowedCollar(retained.RetainedInputBlocks()); rcvr.err != nil {
+				slog.Error("configure zero-copy DSP duty collar", "error", rcvr.err)
 				os.Exit(1)
 			}
 		}
@@ -600,7 +612,7 @@ func (rcvr *Receiver) rebuildDutyDecoder(state *receiverRunState) (bool, bool) {
 		start := len(entries) - skipped
 		complete := true
 		for _, entry := range entries[start:] {
-			if entry.decoded {
+			if entry.decoded || !entry.rawValid {
 				complete = false
 				break
 			}
@@ -640,6 +652,10 @@ func (rcvr *Receiver) rebuildDutyDecoder(state *receiverRunState) (bool, bool) {
 	clearDigestMap(state.dutyNext)
 	pktFound := false
 	for idx, entry := range entries {
+		if !entry.rawValid {
+			rcvr.err = errors.New("dutyscheduler: full collar rebuild lacks retained raw IQ")
+			return pktFound, false
+		}
 		messages := rcvr.d.Decode(entry.data)
 		publish := !entry.decoded && idx >= rcvr.duty.warmupBlocks
 		found, keepRunning := rcvr.processDecodedMessages(state, messages, entry.sampleEnd, entry.wallTime, publish, publish, publish)

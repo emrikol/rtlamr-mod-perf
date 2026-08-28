@@ -15,12 +15,22 @@ import (
 
 const dutyCollarDuration = 100 * time.Millisecond
 
+func dutyCollarBlockCount(cfg protocol.PacketConfig) int {
+	collarBlocks := int((int64(cfg.SampleRate)*int64(dutyCollarDuration) + int64(time.Second)*int64(cfg.BlockSize) - 1) / (int64(time.Second) * int64(cfg.BlockSize)))
+	warmupBlocks := (cfg.BufferLength + cfg.BlockSize - 1) / cfg.BlockSize
+	if collarBlocks <= warmupBlocks {
+		collarBlocks = warmupBlocks + 1
+	}
+	return collarBlocks
+}
+
 type dutyCollarBlock struct {
 	data        []byte
 	sampleStart time.Duration
 	sampleEnd   time.Duration
 	wallTime    time.Time
 	decoded     bool
+	rawValid    bool
 }
 
 type dutyRuntime struct {
@@ -51,6 +61,7 @@ type dutyRuntime struct {
 	collarCount  int
 	collarNext   int
 	warmupBlocks int
+	borrowRaw    bool
 	wasSkipped   bool
 	skippedRun   int
 
@@ -68,6 +79,17 @@ type dutyRuntime struct {
 	checkpointSequence uint64
 	checkpointFailures uint64
 	resume             dutyResumeInfo
+}
+
+func (d *dutyRuntime) useBorrowedCollar(retainedBlocks int) error {
+	if retainedBlocks < len(d.collar) {
+		return fmt.Errorf("dutyscheduler: source retains %d blocks; collar requires %d", retainedBlocks, len(d.collar))
+	}
+	for idx := range d.collar {
+		d.collar[idx].data = nil
+	}
+	d.borrowRaw = true
+	return nil
 }
 
 type dutyResumeInfo struct {
@@ -174,11 +196,8 @@ func newDutyRuntimeWithConfig(cfg protocol.PacketConfig, ids []uint64, scheduler
 	if cfg.SampleRate <= 0 || cfg.BlockSize <= 0 || cfg.BlockSize2 <= 0 || cfg.BufferLength <= 0 {
 		return nil, fmt.Errorf("dutyscheduler: invalid decoder geometry")
 	}
-	collarBlocks := int((int64(cfg.SampleRate)*int64(dutyCollarDuration) + int64(time.Second)*int64(cfg.BlockSize) - 1) / (int64(time.Second) * int64(cfg.BlockSize)))
+	collarBlocks := dutyCollarBlockCount(cfg)
 	warmupBlocks := (cfg.BufferLength + cfg.BlockSize - 1) / cfg.BlockSize
-	if collarBlocks <= warmupBlocks {
-		collarBlocks = warmupBlocks + 1
-	}
 	runtime := &dutyRuntime{
 		mode:                 mode,
 		scheduler:            scheduler,
@@ -251,7 +270,20 @@ func (d *dutyRuntime) needsRebuild(decision dutyscheduler.Decision) bool {
 
 func (d *dutyRuntime) finishBlock(block []byte, start, end time.Duration, wallTime time.Time, decision dutyscheduler.Decision) {
 	entry := &d.collar[d.collarNext]
-	copy(entry.data, block)
+	// A decoded block can never be replayed: a short wake replays only the
+	// immediately preceding skipped run, while a long skipped run replaces the
+	// complete collar before the full decoder rebuild. Retaining decoded raw IQ
+	// therefore spends one block copy without supplying recovery data.
+	entry.rawValid = !decision.Decode
+	if entry.rawValid {
+		if d.borrowRaw {
+			entry.data = block
+		} else {
+			copy(entry.data, block)
+		}
+	} else if d.borrowRaw {
+		entry.data = nil
+	}
 	entry.sampleStart = start
 	entry.sampleEnd = end
 	entry.wallTime = wallTime

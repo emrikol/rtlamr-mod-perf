@@ -42,8 +42,9 @@ var (
 )
 
 var (
-	inputSource  = flag.String("source", "tcp", "sample source: tcp or direct")
-	directDevice = flag.String("device", "0", "RTL-SDR device index or serial for the direct source")
+	inputSource      = flag.String("source", "tcp", "sample source: tcp or direct")
+	directDevice     = flag.String("device", "0", "RTL-SDR device index or serial for the direct source")
+	directKernelRing = flag.Bool("directkernelring", false, "use the optional Linux kernel-owned direct-SDR ring")
 )
 
 var msgType StringMap
@@ -109,6 +110,7 @@ func RegisterFlags() {
 		"version":                    true,
 		"source":                     true,
 		"device":                     true,
+		"directkernelring":           true,
 	}
 
 	printDefaults := func(validFlags map[string]bool, inclusion bool) {
@@ -187,6 +189,9 @@ func HandleFlags() {
 	}
 
 	*dutySchedulerMode = strings.ToLower(*dutySchedulerMode)
+	if *directKernelRing && strings.ToLower(*inputSource) != "direct" {
+		log.Fatal("directkernelring requires source=direct")
+	}
 	switch *dutySchedulerMode {
 	case "off":
 		if *dutySchedulerReport != "" || *dutySchedulerCheckpointDir != "" || *dutySchedulerPolicy != "" {

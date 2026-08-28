@@ -75,6 +75,40 @@ a bounded screen measured roughly **31.9% less process CPU** than the earlier
 direct-copy control. More elaborate persistent-DMA and asynchronous pipeline
 variants did not improve the complete boundary and were not retained.
 
+### Kernel-owned mapped ring
+
+An additional opt-in Linux module makes its fixed USB ring the only raw-IQ
+payload store. The controller DMA-writes ordinary cacheable pages, and rtlamr
+maps them read-only. The decoder reads each mapped block directly. When gated
+DSP is active, the 29-block recovery collar borrows those same pages and holds
+two complete 16-block USB batches before recycling the oldest slot.
+
+This removes both the kernel-to-userspace IQ copy and the userspace collar
+copy. At the reference 2,359,296 complex samples/second, those two eliminated
+copies represent about **9.0 MiB/s** of memory-copy traffic. The mandatory USB
+DMA write remains. The 16 x 262,144-byte ring reserves 4 MiB to preserve input
+headroom; that small capacity increase is intentional.
+
+An anonymized five-minute live sample measured 3.179941% of one Cortex-A72 core
+versus the retained 3.455864% gated direct-input baseline: **7.98% less rtlamr
+CPU**. A separate 60-second interval measured 3.049675% and supported the same
+direction. All configured test streams remained fresh, and the module path had
+no restart, lost-profile-sample, or throttle event.
+
+The matching profile no longer contained the former bulk `copy_to_user` or
+duty-collar `memmove`. Fused DSP was the largest leaf at 36.01% of sampled
+cycles. The kernel-ring descriptor read was 0.12%; ARM64 DMA cache invalidation
+was 0.87%. The remaining 0.27% `runtime.memmove` belonged to decoder result
+assembly rather than IQ transport. Persistent DMA mapping would still require
+the same CPU/device cache-ownership synchronization, so no speculative kernel
+SIMD or custom copy loop is retained.
+
+The feature is selected with `-directkernelring`. Missing modules, device
+nodes, ABI/geometry mismatches, and unsupported builds continue through the
+ordinary direct-SDR path. See
+[`kernel/rtlamr_usb_ring`](kernel/rtlamr_usb_ring) for the generic build and
+ownership contract.
+
 ## Modeled energy implications
 
 Reducing CPU time does not reduce total device power by the same percentage.

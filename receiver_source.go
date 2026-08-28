@@ -17,6 +17,13 @@ type receiverSource interface {
 	Name() string
 }
 
+// retainedInputSource reports how many complete decoder blocks remain valid
+// after Release. Sources backed by persistent mapped storage can let the duty
+// collar borrow those bytes instead of copying them into a second ring.
+type retainedInputSource interface {
+	RetainedInputBlocks() int
+}
+
 type streamReceiverSource struct {
 	reader      io.Reader
 	closer      io.Closer
@@ -125,4 +132,6 @@ type directRTLConfig struct {
 	RTLXtalFreq       uint32
 	TunerXtalFreqSet  bool
 	TunerXtalFreq     uint32
+	KernelRing        bool
+	RetainBatches     uint32
 }

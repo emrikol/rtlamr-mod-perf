@@ -4,14 +4,23 @@ package main
 
 /*
 #cgo pkg-config: libusb-1.0
-#cgo CFLAGS: -I${SRCDIR}/third_party/rtl-sdr/include -I${SRCDIR}/third_party/rtl-sdr/src -DDETACH_KERNEL_DRIVER=1 -Drtlsdr_STATIC
+#cgo CFLAGS: -I${SRCDIR}/third_party/rtl-sdr/include -I${SRCDIR}/third_party/rtl-sdr/src -I${SRCDIR}/kernel/rtlamr_usb_ring -DDETACH_KERNEL_DRIVER=1 -Drtlsdr_STATIC
 #cgo LDFLAGS: -lpthread
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "third_party/rtl-sdr/include/rtl-sdr.h"
+#include "rtlamr_usb_ring.h"
+
+int rtlsdr_attach_kernel_driver(rtlsdr_dev_t *dev);
+int rtlsdr_detach_kernel_driver(rtlsdr_dev_t *dev);
 
 #ifndef RTLAMR_DIRECT_RING_COUNT
 #define RTLAMR_DIRECT_RING_COUNT 4
@@ -44,6 +53,17 @@ typedef struct rtlamr_direct {
 	int read_result;
 	uint32_t buffer_count;
 	uint32_t buffer_length;
+	int kernel_ring_requested;
+	int kernel_ring_active;
+	int kernel_ring_fd;
+	unsigned char **kernel_mappings;
+	struct rtlamr_usb_ring_release *kernel_held;
+	struct rtlamr_usb_ring_completion kernel_current;
+	int kernel_current_valid;
+	uint32_t kernel_slot_count;
+	uint32_t kernel_retain_batches;
+	uint32_t kernel_held_head;
+	uint32_t kernel_held_count;
 } rtlamr_direct;
 
 static void *rtlamr_direct_read_thread(void *opaque) {
@@ -94,11 +114,15 @@ static void *rtlamr_direct_read_thread(void *opaque) {
 	return NULL;
 }
 
-static int rtlamr_direct_open(uint32_t index, rtlamr_direct **output) {
+static int rtlamr_direct_open(uint32_t index, int kernel_ring,
+		uint32_t retain_batches, rtlamr_direct **output) {
 	rtlamr_direct *source = (rtlamr_direct *)calloc(1, sizeof(*source));
 	if (source == NULL) {
 		return -ENOMEM;
 	}
+	source->kernel_ring_fd = -1;
+	source->kernel_ring_requested = kernel_ring;
+	source->kernel_retain_batches = retain_batches;
 	int result = pthread_mutex_init(&source->mutex, NULL);
 	if (result != 0) {
 		free(source);
@@ -121,6 +145,102 @@ static int rtlamr_direct_open(uint32_t index, rtlamr_direct **output) {
 	return 0;
 }
 
+static void rtlamr_direct_kernel_cleanup(rtlamr_direct *source) {
+	if (source->kernel_ring_fd >= 0) {
+		(void)ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_STOP);
+	}
+	if (source->kernel_mappings != NULL) {
+		for (uint32_t index = 0; index < source->kernel_slot_count; index++) {
+			if (source->kernel_mappings[index] != NULL &&
+					source->kernel_mappings[index] != MAP_FAILED) {
+				(void)munmap(source->kernel_mappings[index],
+						source->buffer_length);
+			}
+		}
+	}
+	free(source->kernel_mappings);
+	free(source->kernel_held);
+	source->kernel_mappings = NULL;
+	source->kernel_held = NULL;
+	source->kernel_slot_count = 0;
+	source->kernel_held_head = 0;
+	source->kernel_held_count = 0;
+	source->kernel_current_valid = 0;
+	if (source->kernel_ring_fd >= 0) {
+		(void)close(source->kernel_ring_fd);
+		source->kernel_ring_fd = -1;
+	}
+	if (source->kernel_ring_active) {
+		(void)rtlsdr_detach_kernel_driver(source->dev);
+		source->kernel_ring_active = 0;
+	}
+}
+
+static int rtlamr_direct_kernel_start(rtlamr_direct *source,
+		uint32_t buffer_length) {
+	struct rtlamr_usb_ring_info info;
+	int result = rtlsdr_attach_kernel_driver(source->dev);
+	if (result < 0) {
+		return result;
+	}
+	source->kernel_ring_active = 1;
+
+	for (int attempt = 0; attempt < 100; attempt++) {
+		source->kernel_ring_fd = open(RTLAMR_USB_RING_DEVICE,
+				O_RDONLY | O_CLOEXEC);
+		if (source->kernel_ring_fd >= 0) {
+			break;
+		}
+		if (errno != ENOENT && errno != EACCES) {
+			break;
+		}
+		usleep(10000);
+	}
+	if (source->kernel_ring_fd < 0) {
+		result = -errno;
+		goto fail;
+	}
+	if (ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_INFO, &info) != 0) {
+		result = -errno;
+		goto fail;
+	}
+	if (info.abi != RTLAMR_USB_RING_ABI || info.slot_bytes != buffer_length ||
+			info.slot_count < source->kernel_retain_batches + 2) {
+		result = -EPROTO;
+		goto fail;
+	}
+	source->kernel_slot_count = info.slot_count;
+	source->kernel_mappings = (unsigned char **)calloc(info.slot_count,
+			sizeof(*source->kernel_mappings));
+	source->kernel_held = (struct rtlamr_usb_ring_release *)calloc(
+			info.slot_count, sizeof(*source->kernel_held));
+	if (source->kernel_mappings == NULL || source->kernel_held == NULL) {
+		result = -ENOMEM;
+		goto fail;
+	}
+	for (uint32_t index = 0; index < info.slot_count; index++) {
+		off_t offset = (off_t)index * (off_t)buffer_length;
+		source->kernel_mappings[index] = (unsigned char *)mmap(NULL,
+				buffer_length, PROT_READ, MAP_SHARED,
+				source->kernel_ring_fd, offset);
+		if (source->kernel_mappings[index] == MAP_FAILED) {
+			result = -errno;
+			goto fail;
+		}
+	}
+	if (ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_START) != 0) {
+		result = -errno;
+		goto fail;
+	}
+	source->buffer_count = info.slot_count;
+	source->started = 1;
+	return 0;
+
+fail:
+	rtlamr_direct_kernel_cleanup(source);
+	return result;
+}
+
 static int rtlamr_direct_start(rtlamr_direct *source, uint32_t buffer_count, uint32_t buffer_length) {
 	if (source == NULL || source->started || buffer_count < 2 || buffer_length == 0) {
 		return -EINVAL;
@@ -131,6 +251,20 @@ static int rtlamr_direct_start(rtlamr_direct *source, uint32_t buffer_count, uin
 	}
 	source->buffer_count = buffer_count;
 	source->buffer_length = buffer_length;
+	if (source->kernel_ring_requested) {
+		result = rtlamr_direct_kernel_start(source, buffer_length);
+		if (result == 0) {
+			return 0;
+		}
+		// The optional module must never turn loss of its device node, ABI,
+		// or kernel-version match into loss of radio ingestion. Cleanup has
+		// reclaimed interface zero, so continue through the established
+		// synchronous ring without borrowing its storage.
+		source->stopping = 0;
+		source->read_done = 0;
+		source->read_result = 0;
+		source->buffer_count = buffer_count;
+	}
 	source->slots = (rtlamr_direct_slot *)calloc(buffer_count, sizeof(*source->slots));
 	if (source->slots == NULL) {
 		return -ENOMEM;
@@ -162,6 +296,34 @@ static int rtlamr_direct_next(rtlamr_direct *source, unsigned char **data, uint3
 	if (source == NULL) {
 		return -EINVAL;
 	}
+	if (source->kernel_ring_active) {
+		ssize_t received;
+
+		if (source->kernel_current_valid) {
+			return -EBUSY;
+		}
+		do {
+			received = read(source->kernel_ring_fd, &source->kernel_current,
+					sizeof(source->kernel_current));
+		} while (received < 0 && errno == EINTR);
+		if (received < 0) {
+			return -errno;
+		}
+		if ((size_t)received != sizeof(source->kernel_current)) {
+			return -EIO;
+		}
+		if (source->kernel_current.slot >= source->kernel_slot_count ||
+				source->kernel_current.length != source->buffer_length) {
+			return -EPROTO;
+		}
+		if (source->kernel_current.status < 0) {
+			return source->kernel_current.status;
+		}
+		source->kernel_current_valid = 1;
+		*data = source->kernel_mappings[source->kernel_current.slot];
+		*length = source->kernel_current.length;
+		return 0;
+	}
 	pthread_mutex_lock(&source->mutex);
 	rtlamr_direct_slot *slot = &source->slots[source->consumer];
 	while (slot->state != RTLAMR_SLOT_READY && !source->read_done && !source->stopping) {
@@ -187,6 +349,42 @@ static int rtlamr_direct_release(rtlamr_direct *source) {
 	if (source == NULL) {
 		return -EINVAL;
 	}
+	if (source->kernel_ring_active) {
+		struct rtlamr_usb_ring_release *oldest;
+		struct rtlamr_usb_ring_release current;
+		uint32_t tail;
+
+		if (!source->kernel_current_valid) {
+			return -EINVAL;
+		}
+		current.sequence = source->kernel_current.sequence;
+		current.slot = source->kernel_current.slot;
+		current.reserved = 0;
+		if (source->kernel_retain_batches == 0) {
+			if (ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_RELEASE,
+					&current) != 0) {
+				return -errno;
+			}
+			source->kernel_current_valid = 0;
+			return 0;
+		}
+		if (source->kernel_held_count == source->kernel_retain_batches) {
+			oldest = &source->kernel_held[source->kernel_held_head];
+			if (ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_RELEASE,
+					oldest) != 0) {
+				return -errno;
+			}
+			source->kernel_held_head = (source->kernel_held_head + 1) %
+					source->kernel_slot_count;
+			source->kernel_held_count--;
+		}
+		tail = (source->kernel_held_head + source->kernel_held_count) %
+			source->kernel_slot_count;
+		source->kernel_held[tail] = current;
+		source->kernel_held_count++;
+		source->kernel_current_valid = 0;
+		return 0;
+	}
 	pthread_mutex_lock(&source->mutex);
 	rtlamr_direct_slot *slot = &source->slots[source->consumer];
 	if (slot->state != RTLAMR_SLOT_CLAIMED) {
@@ -198,6 +396,11 @@ static int rtlamr_direct_release(rtlamr_direct *source) {
 	source->consumer = (source->consumer + 1) % source->buffer_count;
 	pthread_cond_broadcast(&source->condition);
 	pthread_mutex_unlock(&source->mutex);
+	if (source->kernel_ring_active && source->kernel_ring_fd >= 0 &&
+			ioctl(source->kernel_ring_fd, RTLAMR_USB_RING_IOC_STOP) != 0 &&
+			errno != ENODEV) {
+		return -errno;
+	}
 	return 0;
 }
 
@@ -217,13 +420,18 @@ static int rtlamr_direct_close(rtlamr_direct *source) {
 		return 0;
 	}
 	rtlamr_direct_cancel(source);
-	if (source->started) {
+	if (source->kernel_ring_active) {
+		rtlamr_direct_kernel_cleanup(source);
+		source->started = 0;
+	} else if (source->started) {
 		pthread_join(source->thread, NULL);
 		source->started = 0;
 	}
 	int result = rtlsdr_close(source->dev);
-	for (uint32_t index = 0; index < source->buffer_count; index++) {
-		free(source->slots[index].data);
+	if (source->slots != NULL) {
+		for (uint32_t index = 0; index < source->buffer_count; index++) {
+			free(source->slots[index].data);
+		}
 	}
 	free(source->slots);
 	pthread_cond_destroy(&source->condition);
@@ -254,6 +462,7 @@ static int rtlamr_direct_set_gain_by_index(rtlamr_direct *source, uint32_t index
 
 static int rtlamr_direct_device_count(void) { return (int)rtlsdr_get_device_count(); }
 static uint32_t rtlamr_direct_ring_count(void) { return RTLAMR_DIRECT_RING_COUNT; }
+static int rtlamr_direct_kernel_active(rtlamr_direct *source) { return source->kernel_ring_active; }
 static int rtlamr_direct_index_by_serial(const char *serial) { return rtlsdr_get_index_by_serial(serial); }
 static const char *rtlamr_direct_device_name(uint32_t index) { return rtlsdr_get_device_name(index); }
 static int rtlamr_direct_tuner_type(rtlamr_direct *source) { return (int)rtlsdr_get_tuner_type(source->dev); }
@@ -279,14 +488,15 @@ import (
 )
 
 type directRTLSource struct {
-	state       *C.rtlamr_direct
-	blockBytes  int
-	batchActive bool
-	deviceName  string
-	cancelOnce  sync.Once
-	closeOnce   sync.Once
-	cancelErr   error
-	closeErr    error
+	state          *C.rtlamr_direct
+	blockBytes     int
+	batchActive    bool
+	deviceName     string
+	retainedBlocks int
+	cancelOnce     sync.Once
+	closeOnce      sync.Once
+	cancelErr      error
+	closeErr       error
 }
 
 func directRTLSourceAvailable() bool { return true }
@@ -295,7 +505,7 @@ func directRTLError(operation string, result C.int) error {
 	if result >= 0 {
 		return nil
 	}
-	return fmt.Errorf("%s failed: librtlsdr code %d", operation, int(result))
+	return fmt.Errorf("%s failed: code %d", operation, int(result))
 }
 
 func directRTLBool(value bool) C.int {
@@ -330,7 +540,7 @@ func newDirectRTLSource(config directRTLConfig) (receiverSource, uint32, uint32,
 		return nil, 0, 0, err
 	}
 	var state *C.rtlamr_direct
-	if result := C.rtlamr_direct_open(C.uint32_t(index), &state); result < 0 {
+	if result := C.rtlamr_direct_open(C.uint32_t(index), directRTLBool(config.KernelRing), C.uint32_t(config.RetainBatches), &state); result < 0 {
 		return nil, 0, 0, directRTLError("open RTL-SDR device", result)
 	}
 	source := &directRTLSource{
@@ -406,8 +616,13 @@ func newDirectRTLSource(config directRTLConfig) (receiverSource, uint32, uint32,
 	if result := C.rtlamr_direct_start(state, C.rtlamr_direct_ring_count(), C.uint32_t(config.BatchBytes)); result < 0 {
 		return fail("start RTL-SDR asynchronous reader", result)
 	}
+	if C.rtlamr_direct_kernel_active(state) != 0 {
+		source.retainedBlocks = int(config.RetainBatches) * int(config.BatchBytes/config.BlockBytes)
+	}
 	return source, uint32(tunerType), uint32(gainCount), nil
 }
+
+func (source *directRTLSource) RetainedInputBlocks() int { return source.retainedBlocks }
 
 func (source *directRTLSource) Name() string {
 	if source.deviceName == "" {
