@@ -311,11 +311,6 @@ func (d *Decoder) decodeQuantized() (messages []Message) {
 // unchanged; a shared packet projection is materialized lazily at most once
 // per preamble.
 func (d *Decoder) parseCandidates(indices []int, parsers []Parser, messages []Message) []Message {
-	if len(parsers) == 1 {
-		if indexParser, ok := parsers[0].(CandidateIndexParser); ok {
-			return indexParser.ParseCandidateIndices(indices, messages)
-		}
-	}
 	var packets []Data
 	materialized := false
 	includeBits := false
@@ -895,46 +890,38 @@ func (d Decoder) Slice(indices []int) (pkts []Data) {
 	return d.slice(indices, true)
 }
 
-// PacketBytesAt projects one candidate directly into caller-owned storage.
-// The destination must be large enough for the configured packet. It lets
-// index-aware parsers avoid allocating an intermediate Data value while using
-// the exact same decision-ring traversal as Slice.
-func (d *Decoder) PacketBytesAt(qIdx int, destination []byte) bool {
-	if qIdx < 0 || qIdx > d.Cfg.BlockSize || len(destination) < len(d.pkt) {
-		return false
-	}
-
-	qPhysical := d.quantizedStart + qIdx
-	if qPhysical >= len(d.Quantized) {
-		qPhysical -= len(d.Quantized)
-	}
-	remainingSymbols := d.Cfg.PacketSymbols
-	for packetByte := range d.pkt {
-		bitsInByte := 8
-		if remainingSymbols < bitsInByte {
-			bitsInByte = remainingSymbols
-		}
-		value := destination[packetByte]
-		for bit := 0; bit < bitsInByte; bit++ {
-			value = value<<1 | d.Quantized[qPhysical]
-			qPhysical += d.Cfg.SymbolLength
-			if qPhysical >= len(d.Quantized) {
-				qPhysical -= len(d.Quantized)
-			}
-		}
-		destination[packetByte] = value
-		remainingSymbols -= bitsInByte
-	}
-	return true
-}
-
 func (d *Decoder) slice(indices []int, includeBits bool) (pkts []Data) {
 	// For each of the indices the preamble exists at.
 	for _, qIdx := range indices {
 		// Check that we're still within the first sample block. We'll catch
 		// the message on the next sample block otherwise.
-		if !d.PacketBytesAt(qIdx, d.pkt) {
+		if qIdx > d.Cfg.BlockSize {
 			continue
+		}
+
+		// Walk the decision ring once and assemble each output byte in a
+		// register. This avoids a multiply, modulo-style ring lookup, and
+		// read/modify/write of d.pkt for every packet symbol.
+		qPhysical := d.quantizedStart + qIdx
+		if qPhysical >= len(d.Quantized) {
+			qPhysical -= len(d.Quantized)
+		}
+		remainingSymbols := d.Cfg.PacketSymbols
+		for packetByte := range d.pkt {
+			bitsInByte := 8
+			if remainingSymbols < bitsInByte {
+				bitsInByte = remainingSymbols
+			}
+			value := d.pkt[packetByte]
+			for bit := 0; bit < bitsInByte; bit++ {
+				value = value<<1 | d.Quantized[qPhysical]
+				qPhysical += d.Cfg.SymbolLength
+				if qPhysical >= len(d.Quantized) {
+					qPhysical -= len(d.Quantized)
+				}
+			}
+			d.pkt[packetByte] = value
+			remainingSymbols -= bitsInByte
 		}
 
 		// Store the packet in the seen map and append to the packet list.

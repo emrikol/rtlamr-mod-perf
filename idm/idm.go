@@ -32,13 +32,12 @@ func init() {
 
 type Parser struct {
 	crc.CRC
-	cfg     protocol.PacketConfig
-	data    protocol.Data
-	seen    map[[92]byte]struct{}
-	decoder *protocol.Decoder
+	cfg  protocol.PacketConfig
+	data protocol.Data
+	seen map[[92]byte]struct{}
 }
 
-func (p *Parser) SetDecoder(decoder *protocol.Decoder) { p.decoder = decoder }
+func (p Parser) SetDecoder(*protocol.Decoder) {}
 
 func (p Parser) Power16Compatible() bool { return true }
 
@@ -65,7 +64,7 @@ func NewParser(chipLength int) (p protocol.Parser) {
 
 func (p Parser) PacketBytesOnly() bool { return true }
 
-func (p *Parser) resetSeen() {
+func (p *Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
 	if p.seen == nil {
 		p.seen = make(map[[92]byte]struct{})
 	} else {
@@ -73,62 +72,39 @@ func (p *Parser) resetSeen() {
 			delete(p.seen, packet)
 		}
 	}
-}
 
-func (p *Parser) parseCurrent(messages []protocol.Message) []protocol.Message {
-	var packet [92]byte
-	copy(packet[:], p.data.Bytes)
-	if _, duplicate := p.seen[packet]; duplicate {
-		return messages
-	}
-	p.seen[packet] = struct{}{}
-
-	// If the packet checksum fails, bail.
-	if residue := p.Checksum(p.data.Bytes[4:92]); residue != p.Residue {
-		return messages
-	}
-
-	// If the serial checksum fails, bail.
-	var serial [6]byte
-	copy(serial[:], p.data.Bytes[9:13])
-	copy(serial[4:], p.data.Bytes[88:90])
-	if residue := p.Checksum(serial[:]); residue != p.Residue {
-		return messages
-	}
-
-	idm := NewIDM(p.data)
-	if idm.ERTSerialNumber == 0 {
-		return messages
-	}
-	return append(messages, idm)
-}
-
-func (p *Parser) Parse(pkts []protocol.Data, messages []protocol.Message) []protocol.Message {
-	p.resetSeen()
 	for _, pkt := range pkts {
 		p.data.Idx = pkt.Idx
 		copy(p.data.Bytes, pkt.Bytes)
-		messages = p.parseCurrent(messages)
-	}
 
-	return messages
-}
-
-// ParseCandidateIndices writes packet bytes directly into the parser's
-// reusable buffer. It avoids allocating protocol.Data and copying the same 92
-// bytes twice on the decoder hot path while retaining Parse for external users.
-func (p *Parser) ParseCandidateIndices(indices []int, messages []protocol.Message) []protocol.Message {
-	if p.decoder == nil {
-		return messages
-	}
-	p.resetSeen()
-	for _, index := range indices {
-		if !p.decoder.PacketBytesAt(index, p.data.Bytes) {
+		var packet [92]byte
+		copy(packet[:], p.data.Bytes)
+		if _, duplicate := p.seen[packet]; duplicate {
 			continue
 		}
-		p.data.Idx = index
-		messages = p.parseCurrent(messages)
+		p.seen[packet] = struct{}{}
+
+		// If the packet checksum fails, bail.
+		if residue := p.Checksum(p.data.Bytes[4:92]); residue != p.Residue {
+			continue
+		}
+
+		// If the serial checksum fails, bail.
+		var serial [6]byte
+		copy(serial[:], p.data.Bytes[9:13])
+		copy(serial[4:], p.data.Bytes[88:90])
+		if residue := p.Checksum(serial[:]); residue != p.Residue {
+			continue
+		}
+
+		idm := NewIDM(p.data)
+		if idm.ERTSerialNumber == 0 {
+			continue
+		}
+
+		messages = append(messages, idm)
 	}
+
 	return messages
 }
 
@@ -218,7 +194,6 @@ func (interval Interval) Record() (r []string) {
 
 var _ protocol.Power16Compatible = (*Parser)(nil)
 var _ protocol.PacketBytesOnly = (*Parser)(nil)
-var _ protocol.CandidateIndexParser = (*Parser)(nil)
 
 func (idm IDM) MsgType() string {
 	return "IDM"
