@@ -100,7 +100,9 @@ duty-collar `memmove`. Fused DSP was the largest leaf at 36.01% of sampled
 cycles. The kernel-ring descriptor read was 0.12%; ARM64 DMA cache invalidation
 was 0.87%. The remaining 0.27% `runtime.memmove` belonged to decoder result
 assembly rather than IQ transport. Persistent DMA mapping would still require
-the same CPU/device cache-ownership synchronization, so no speculative kernel
+a device-to-CPU cache-ownership synchronization before cacheable userspace
+reads, but can avoid mapping and unmapping the same preallocated slot on every
+reuse. That follow-up remains hardware-qualified work; no speculative kernel
 SIMD or custom copy loop is retained.
 
 The feature is selected with `-directkernelring`. Missing modules, device
@@ -108,6 +110,25 @@ nodes, ABI/geometry mismatches, and unsupported builds continue through the
 ordinary direct-SDR path. See
 [`kernel/rtlamr_usb_ring`](kernel/rtlamr_usb_ring) for the generic build and
 ownership contract.
+
+### Offline ring candidate bank
+
+`offline_ring_bank_test.go` provides an opt-in corpus harness for screening
+transport geometry and actuator placement without touching a radio or loading a
+kernel module. It sweeps 256 KiB, 512 KiB, and 1 MiB batches; per-block,
+per-batch, and modeled kernel-plan actuation; and several wake widths. Every
+candidate is checked against the complete decoder's ordered message digests and
+the production recovery-collar path.
+
+```sh
+RTLAMR_OFFLINE_BANK_CORPUS=/path/to/block-aligned.iq \
+  go test -run TestOfflineKernelRingCandidateBank -count=1 -v .
+```
+
+Results are emitted as `OFFLINE_RING_BANK` JSON records. Local replay can reject
+semantic or collar failures and compare DSP-block and handoff inventories. It
+does not rank DMA cacheability, xHCI, IRQ, or coherent-memory performance;
+those remain exact-hardware measurements.
 
 ## Modeled energy implications
 
