@@ -16,9 +16,9 @@ var (
 	power16R900SelectedPlatform power16R900Platform
 )
 
-func power16R900CurrentPlatform() power16R900Platform {
+func power16R900CurrentPlatform() *power16R900Platform {
 	power16R900PlatformOnce.Do(power16R900ProbePlatform)
-	return power16R900SelectedPlatform
+	return &power16R900SelectedPlatform
 }
 
 func power16R900ProbePlatform() {

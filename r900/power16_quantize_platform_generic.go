@@ -2,9 +2,11 @@
 
 package r900
 
-func power16R900CurrentPlatform() power16R900Platform {
-	return power16R900Platform{
-		implementation: power16R900PortableImplementation,
-		fallbackReason: "unsupported-platform",
-	}
+var power16R900PortablePlatform = power16R900Platform{
+	implementation: power16R900PortableImplementation,
+	fallbackReason: "unsupported-platform",
+}
+
+func power16R900CurrentPlatform() *power16R900Platform {
+	return &power16R900PortablePlatform
 }
