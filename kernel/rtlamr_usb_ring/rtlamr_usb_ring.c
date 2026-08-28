@@ -162,6 +162,17 @@ static int rtlamr_ring_start(struct rtlamr_usb_ring *ring)
 		result = -EBUSY;
 		goto unlock_state;
 	}
+	spin_unlock_irqrestore(&ring->lock, flags);
+	result = usb_set_interface(ring->udev,
+			ring->interface->cur_altsetting->desc.bInterfaceNumber,
+			ring->interface->cur_altsetting->desc.bAlternateSetting);
+	if (result)
+		goto unlock_io;
+	spin_lock_irqsave(&ring->lock, flags);
+	if (ring->disconnected) {
+		result = -ENODEV;
+		goto unlock_state;
+	}
 	ring->stopping = false;
 	ring->fatal_error = 0;
 	ring->next_claim = 0;
@@ -194,6 +205,7 @@ static int rtlamr_ring_start(struct rtlamr_usb_ring *ring)
 
 unlock_state:
 	spin_unlock_irqrestore(&ring->lock, flags);
+unlock_io:
 	mutex_unlock(&ring->io_mutex);
 	return result;
 }
@@ -524,7 +536,8 @@ static int rtlamr_probe(struct usb_interface *interface,
 			goto fail;
 		}
 		usb_fill_bulk_urb(slot->urb, ring->udev,
-				  usb_rcvbulkpipe(ring->udev, ring->endpoint),
+				  usb_rcvbulkpipe(ring->udev,
+					ring->endpoint & USB_ENDPOINT_NUMBER_MASK),
 				  slot->data, ring->slot_bytes, rtlamr_complete,
 				  slot);
 	}
