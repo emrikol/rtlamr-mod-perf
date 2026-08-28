@@ -240,13 +240,30 @@ wall time; treating process downtime as a sampled interval would manufacture a
 phase discontinuity and unnecessarily discard a valid evidence epoch.
 
 The exact Clopper-Pearson bound is cached by each sender's evidence tuple
-(`events`, `misses`, and confidence alpha). Qualification timers and fail-open
-checks still run for every block, but unchanged evidence does not repeat the
-80-step numerical solver. A regression benchmark covering learned senders in
-the estimating state fell from about 8.9 microseconds to 0.29 microseconds per
-block on the development ARM64 system, with identical bounds and zero
-allocations. The cached path measured 1.70--1.72 microseconds per block on the
-reference Cortex-A72, or about 0.05% of one core at 288 blocks per second.
+(`events`, `misses`, and confidence alpha), so unchanged evidence does not
+repeat the 80-step numerical solver. A regression benchmark covering learned
+senders in the estimating state fell from about 8.9 microseconds to 0.29
+microseconds per block on the development ARM64 system, with identical bounds
+and zero allocations. The cached path measured 1.70--1.72 microseconds per
+block on the reference Cortex-A72, or about 0.05% of one core at 288 blocks per
+second.
+
+The later hot-path cleanup retains maps only for sender-ID lookup and checkpoint
+serialization. Repeated candidate and sender traversal uses canonical slices,
+eliminating Go's randomized map-iterator setup. Qualification is recomputed
+only when evidence first becomes eligible, an observation changes its inputs,
+or a promotion/recovery deadline becomes due. Per-block candidate selection,
+wake-window scoring, watchdog enforcement, and fail-open decisions remain in
+place.
+
+On a Cortex-A72, an eight-row counterbalanced screen of the complete default
+seven-candidate, three-sender estimating bank measured 6.074--6.293
+microseconds per block for the prior implementation and 434.6--461.1
+nanoseconds for the optimized path. The medians were 6.1815 microseconds and
+435.3 nanoseconds: **92.96% less scheduler time, or 14.2x faster**, with zero
+allocations in either path. A forced-full-refresh oracle and optimized scheduler
+produced identical decisions, exported state, candidate selection, audit state,
+and resume state across deterministic randomized traces and Go fuzzing.
 
 Sender inventories are sorted before configuration is fingerprinted. Sender
 order has no policy meaning, so this prevents Go map iteration order from

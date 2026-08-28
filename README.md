@@ -41,9 +41,11 @@ optional direct RTL-SDR input path when their runtime gates pass.
   adaptive history, and recoverable evidence epochs track drift after initial
   qualification. Versioned checkpoints can promote compatible shadow evidence
   into gated mode while forcing continuous-DSP recovery first. Exact confidence
-  results are cached by evidence tuple, and sender configuration is
-  canonicalized so estimating-state block processing stays cheap and unchanged
-  policies resume deterministically. A capture-target-only change preserves
+  results are cached by evidence tuple; canonical indexed traversal and
+  change-driven qualification keep estimating-state processing cheap without
+  weakening per-block wake, watchdog, audit, or fail-open decisions. Sender
+  configuration is canonicalized so unchanged policies resume
+  deterministically. A capture-target-only change preserves
   independently learned cadence, watchdogs, and evidence after proving every
   other normalized configuration field is identical; qualification and its
   stability timer always restart under the new target. Full-state resumes stay
