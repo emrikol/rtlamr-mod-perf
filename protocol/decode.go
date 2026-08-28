@@ -253,6 +253,53 @@ func (d *Decoder) Allocate() {
 	return
 }
 
+// Reset restores the allocated decoder to its post-Allocate history state
+// without repeating immutable parser registration, platform probing, startup
+// equivalence tests, or buffer allocation. It is intended for callers that
+// must replay a complete warm-up prefix after intentionally skipping input.
+func (d *Decoder) Reset() {
+	d.quantizedStart = 0
+	if len(d.quantizedBacking) != 0 {
+		owned := d.ownsQuantizedRing()
+		clear(d.quantizedBacking)
+		if !owned {
+			clear(d.Quantized)
+		}
+	} else {
+		clear(d.Quantized)
+	}
+	clear(d.filterScratch)
+	d.filterOutput = d.filterScratch
+	clear(d.pkt)
+	d.sIdxA = d.sIdxA[:0]
+	d.sIdxB = d.sIdxB[:0]
+
+	if d.power16 != nil {
+		state := d.power16
+		clear(state.backing)
+		state.block = state.blockCount - 1
+		state.nativeBlocks = 0
+		state.packedStart = 0
+		clear(state.packedBacking)
+		if state.runPacked != nil {
+			d.packed = state.packedSearchWindow()
+		} else {
+			clear(d.packed)
+		}
+		return
+	}
+
+	if len(d.signalBacking) != 0 {
+		clear(d.signalBacking)
+		d.signalBlock = d.signalBlockCount - 1
+		start := d.signalBlock * d.signalBlockStride
+		d.Signal = d.signalBacking[start+d.signalHistoryOverlap-d.Cfg.SymbolLength : start+d.signalBlockStride]
+	} else {
+		clear(d.Signal)
+	}
+	clear(d.packed)
+}
+
 // Decode accepts a sample block and returns the messages it contains.
 func (d *Decoder) Decode(input []byte) (messages []Message) {
 	if d.power16 != nil {

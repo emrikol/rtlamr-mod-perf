@@ -1,6 +1,7 @@
 package dutyscheduler
 
 import (
+	"encoding/json"
 	"math"
 	"math/rand"
 	"reflect"
@@ -401,6 +402,9 @@ func primeCandidateForControllerTest(t *testing.T, scheduler *Scheduler, candida
 		sender.postWake = time.Second
 		sender.events = required
 	}
+	// Tests mutate model internals directly; production observations invalidate
+	// this derived cache through Scheduler.observe.
+	candidate.invalidateSchedule()
 	scheduler.refreshQualifications(now)
 	scheduler.refreshQualifications(now + scheduler.cfg.PromotionStability)
 	if !candidate.qualified {
@@ -685,10 +689,27 @@ func exerciseQualificationDeferral(t *testing.T, operations []byte) {
 			start += duration
 		}
 		end := start + duration
+		// Force the comparison scheduler through the uncached schedule and
+		// watchdog paths. Resetting countStart makes its rolling count scan the
+		// complete retained observation window, matching the original
+		// implementation rather than sharing the optimized cursor.
+		for _, candidate := range full.candidates {
+			candidate.invalidateSchedule()
+		}
+		for _, sender := range full.senderList {
+			sender.countStart = 0
+		}
+		full.watchdogDirty = true
+
 		fastDecision := fast.Advance(start, end)
 		fullDecision := full.Advance(start, end)
 		if fastDecision != fullDecision {
 			t.Fatalf("decision differs at step %d: fast=%+v full=%+v", step, fastDecision, fullDecision)
+		}
+		for idx := range fast.candidates {
+			if fast.candidates[idx].lastAwake != full.candidates[idx].lastAwake || fast.candidates[idx].lastEligible != full.candidates[idx].lastEligible {
+				t.Fatalf("candidate schedule differs at step %d operation=%#02x start=%s end=%s candidate=%s fast=(eligible=%t awake=%t until=%f next=%f) full=(eligible=%t awake=%t)", step, operation, start, end, fast.candidates[idx].cfg.Name, fast.candidates[idx].lastEligible, fast.candidates[idx].lastAwake, fast.candidates[idx].wakeUntil, fast.candidates[idx].nextWakeStart, full.candidates[idx].lastEligible, full.candidates[idx].lastAwake)
+			}
 		}
 		now = end
 
@@ -732,7 +753,16 @@ func assertEquivalentSchedulers(t *testing.T, fast, full *Scheduler, step int) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(fastState, fullState) {
-		t.Fatalf("exported state differs at step %d", step)
+		fastJSON, _ := json.Marshal(fastState)
+		fullJSON, _ := json.Marshal(fullState)
+		first := 0
+		for first < len(fastJSON) && first < len(fullJSON) && fastJSON[first] == fullJSON[first] {
+			first++
+		}
+		start := max(0, first-120)
+		fastEnd := min(len(fastJSON), first+240)
+		fullEnd := min(len(fullJSON), first+240)
+		t.Fatalf("exported state differs at step %d byte %d\nfast: %s\nfull: %s", step, first, fastJSON[start:fastEnd], fullJSON[start:fullEnd])
 	}
 	if fast.selectedName() != full.selectedName() || fast.lastDecision != full.lastDecision || fast.quietActive != full.quietActive || fast.auditActive != full.auditActive || fast.quietCandidate != full.quietCandidate || !reflect.DeepEqual(fast.reanchorPending, full.reanchorPending) {
 		t.Fatalf("runtime state differs at step %d", step)

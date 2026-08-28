@@ -491,6 +491,16 @@ static int rtlamr_direct_set_gain_by_index(rtlamr_direct *source, uint32_t index
 static int rtlamr_direct_device_count(void) { return (int)rtlsdr_get_device_count(); }
 static uint32_t rtlamr_direct_ring_count(void) { return RTLAMR_DIRECT_RING_COUNT; }
 static int rtlamr_direct_kernel_active(rtlamr_direct *source) { return source->kernel_ring_active; }
+static int rtlamr_direct_kernel_fd(rtlamr_direct *source) { return source->kernel_ring_fd; }
+static uint32_t rtlamr_direct_kernel_slot_count(rtlamr_direct *source) { return source->kernel_slot_count; }
+static unsigned char *rtlamr_direct_kernel_mapping(rtlamr_direct *source, uint32_t slot) {
+	if (source == NULL || source->kernel_mappings == NULL ||
+			slot >= source->kernel_slot_count) {
+		return NULL;
+	}
+	return source->kernel_mappings[slot];
+}
+static unsigned long rtlamr_direct_kernel_exchange_command(void) { return RTLAMR_USB_RING_IOC_EXCHANGE; }
 static int rtlamr_direct_index_by_serial(const char *serial) { return rtlsdr_get_index_by_serial(serial); }
 static const char *rtlamr_direct_device_name(uint32_t index) { return rtlsdr_get_device_name(index); }
 static int rtlamr_direct_tuner_type(rtlamr_direct *source) { return (int)rtlsdr_get_tuner_type(source->dev); }
@@ -510,21 +520,56 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"sync"
+	"syscall"
 	"unsafe"
 )
 
+type directRTLRingRelease struct {
+	Sequence uint64
+	Slot     uint32
+	Reserved uint32
+}
+
+type directRTLRingCompletion struct {
+	Sequence uint64
+	Slot     uint32
+	Length   uint32
+	Status   int32
+	Reserved uint32
+}
+
+type directRTLRingExchange struct {
+	ReleaseValid uint32
+	Reserved     uint32
+	Release      directRTLRingRelease
+	Completion   directRTLRingCompletion
+}
+
 type directRTLSource struct {
-	state          *C.rtlamr_direct
-	blockBytes     int
-	batchActive    bool
-	deviceName     string
-	retainedBlocks int
-	cancelOnce     sync.Once
-	closeOnce      sync.Once
-	cancelErr      error
-	closeErr       error
+	state                 *C.rtlamr_direct
+	blockBytes            int
+	batchActive           bool
+	deviceName            string
+	retainedBlocks        int
+	kernelRing            bool
+	kernelFD              int
+	kernelExchangeCommand uintptr
+	kernelMappings        []unsafe.Pointer
+	kernelRetain          int
+	kernelHeld            []directRTLRingRelease
+	kernelHeldHead        int
+	kernelHeldCount       int
+	kernelPending         directRTLRingRelease
+	kernelPendingValid    bool
+	kernelCurrent         directRTLRingCompletion
+	kernelCurrentValid    bool
+	cancelOnce            sync.Once
+	closeOnce             sync.Once
+	cancelErr             error
+	closeErr              error
 }
 
 func directRTLSourceAvailable() bool { return true }
@@ -560,6 +605,11 @@ func directRTLDeviceIndex(device string) (uint32, error) {
 }
 
 func newDirectRTLSource(config directRTLConfig) (receiverSource, uint32, uint32, error) {
+	if unsafe.Sizeof(directRTLRingRelease{}) != uintptr(C.sizeof_struct_rtlamr_usb_ring_release) ||
+		unsafe.Sizeof(directRTLRingCompletion{}) != uintptr(C.sizeof_struct_rtlamr_usb_ring_completion) ||
+		unsafe.Sizeof(directRTLRingExchange{}) != uintptr(C.sizeof_struct_rtlamr_usb_ring_exchange) {
+		return nil, 0, 0, fmt.Errorf("kernel RTL-SDR ring ABI layout mismatch")
+	}
 	if config.BlockBytes == 0 || config.BatchBytes == 0 || config.BatchBytes%config.BlockBytes != 0 || config.BatchBytes%512 != 0 {
 		return nil, 0, 0, fmt.Errorf("direct RTL-SDR batch bytes must be a positive multiple of 512")
 	}
@@ -645,6 +695,25 @@ func newDirectRTLSource(config directRTLConfig) (receiverSource, uint32, uint32,
 		return fail("start RTL-SDR asynchronous reader", result)
 	}
 	if C.rtlamr_direct_kernel_active(state) != 0 {
+		source.kernelRing = true
+		source.kernelFD = int(C.rtlamr_direct_kernel_fd(state))
+		source.kernelExchangeCommand = uintptr(C.rtlamr_direct_kernel_exchange_command())
+		source.kernelRetain = int(config.RetainBatches)
+		slotCount := int(C.rtlamr_direct_kernel_slot_count(state))
+		if source.kernelFD < 0 || slotCount < source.kernelRetain+2 {
+			_ = source.Close()
+			return nil, 0, 0, fmt.Errorf("kernel RTL-SDR ring returned invalid queue geometry")
+		}
+		source.kernelMappings = make([]unsafe.Pointer, slotCount)
+		source.kernelHeld = make([]directRTLRingRelease, slotCount)
+		for slot := range source.kernelMappings {
+			mapping := C.rtlamr_direct_kernel_mapping(state, C.uint32_t(slot))
+			if mapping == nil {
+				_ = source.Close()
+				return nil, 0, 0, fmt.Errorf("kernel RTL-SDR ring slot %d is not mapped", slot)
+			}
+			source.kernelMappings[slot] = unsafe.Pointer(mapping)
+		}
 		source.retainedBlocks = int(config.RetainBatches) * int(config.BatchBytes/config.BlockBytes)
 	}
 	return source, uint32(tunerType), uint32(gainCount), nil
@@ -662,6 +731,14 @@ func (source *directRTLSource) Name() string {
 func (source *directRTLSource) Next() ([]byte, error) {
 	if source.batchActive {
 		return nil, fmt.Errorf("direct RTL-SDR batch was not released")
+	}
+	if source.kernelRing {
+		batch, err := source.nextKernelBatch()
+		if err != nil {
+			return nil, err
+		}
+		source.batchActive = true
+		return batch, nil
 	}
 	var data *C.uchar
 	var length C.uint32_t
@@ -682,11 +759,87 @@ func (source *directRTLSource) Release() error {
 	if !source.batchActive {
 		return fmt.Errorf("no active direct RTL-SDR batch")
 	}
-	if result := C.rtlamr_direct_release(source.state); result < 0 {
+	if source.kernelRing {
+		if err := source.releaseKernelBatch(); err != nil {
+			return err
+		}
+	} else if result := C.rtlamr_direct_release(source.state); result < 0 {
 		return directRTLError("release RTL-SDR ring batch", result)
 	}
 	source.batchActive = false
 	return nil
+}
+
+func (source *directRTLSource) nextKernelBatch() ([]byte, error) {
+	if source.kernelCurrentValid {
+		return nil, fmt.Errorf("kernel RTL-SDR batch was not released")
+	}
+	exchange := directRTLRingExchange{}
+	if source.kernelPendingValid {
+		exchange.ReleaseValid = 1
+		exchange.Release = source.kernelPending
+	}
+	if err := directRTLKernelIOCTL(source.kernelFD, source.kernelExchangeCommand, unsafe.Pointer(&exchange)); err != nil {
+		return nil, fmt.Errorf("exchange kernel RTL-SDR ring batch: %w", err)
+	}
+	source.kernelPendingValid = false
+	completion := exchange.Completion
+	if completion.Reserved != 0 || int(completion.Slot) >= len(source.kernelMappings) ||
+		completion.Length == 0 || int(completion.Length)%source.blockBytes != 0 {
+		return nil, fmt.Errorf("kernel RTL-SDR ring returned invalid completion")
+	}
+	if completion.Status < 0 {
+		return nil, fmt.Errorf("kernel RTL-SDR transfer failed: code %d", completion.Status)
+	}
+	source.kernelCurrent = completion
+	source.kernelCurrentValid = true
+	batchBytes := int(completion.Length)
+	return (*[1 << 30]byte)(source.kernelMappings[completion.Slot])[:batchBytes:batchBytes], nil
+}
+
+func (source *directRTLSource) releaseKernelBatch() error {
+	if !source.kernelCurrentValid {
+		return fmt.Errorf("no active kernel RTL-SDR batch")
+	}
+	current := directRTLRingRelease{
+		Sequence: source.kernelCurrent.Sequence,
+		Slot:     source.kernelCurrent.Slot,
+	}
+	if source.kernelRetain == 0 {
+		if source.kernelPendingValid {
+			return fmt.Errorf("kernel RTL-SDR release queue is already occupied")
+		}
+		source.kernelPending = current
+		source.kernelPendingValid = true
+	} else {
+		if source.kernelHeldCount == source.kernelRetain {
+			if source.kernelPendingValid {
+				return fmt.Errorf("kernel RTL-SDR release queue is already occupied")
+			}
+			source.kernelPending = source.kernelHeld[source.kernelHeldHead]
+			source.kernelPendingValid = true
+			source.kernelHeldHead = (source.kernelHeldHead + 1) % len(source.kernelHeld)
+			source.kernelHeldCount--
+		}
+		tail := (source.kernelHeldHead + source.kernelHeldCount) % len(source.kernelHeld)
+		source.kernelHeld[tail] = current
+		source.kernelHeldCount++
+	}
+	source.kernelCurrentValid = false
+	return nil
+}
+
+func directRTLKernelIOCTL(fd int, command uintptr, argument unsafe.Pointer) error {
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), command, uintptr(argument))
+		runtime.KeepAlive(argument)
+		if errno == 0 {
+			return nil
+		}
+		if errno != syscall.EINTR {
+			return errno
+		}
+	}
 }
 
 func (source *directRTLSource) Cancel() error {

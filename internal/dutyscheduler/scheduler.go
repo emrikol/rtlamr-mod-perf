@@ -189,6 +189,11 @@ type candidate struct {
 	wakeScale        float64
 	promotionReady   time.Duration
 	recoveryUntil    time.Duration
+	eligibilityDirty bool
+	eligibleCached   bool
+	wakeCacheValid   bool
+	wakeUntil        float64
+	nextWakeStart    float64
 }
 
 type senderRuntime struct {
@@ -211,6 +216,7 @@ type senderRuntime struct {
 	obligationsOpened   uint64
 	obligationsClosed   uint64
 	obligationDeficits  uint64
+	countStart          int
 }
 
 type protocolRuntime struct {
@@ -221,27 +227,29 @@ type protocolRuntime struct {
 }
 
 type Scheduler struct {
-	cfg              Config
-	candidates       []*candidate
-	senders          map[uint64]*senderRuntime
-	senderList       []*senderRuntime
-	selected         *candidate
-	lastEnd          time.Duration
-	started          bool
-	lastDecision     Decision
-	recoveryUntil    time.Duration
-	deadlineDeficits uint64
-	countDeficits    uint64
-	discontinuities  uint64
-	rng              uint64
-	quietActive      bool
-	auditActive      bool
-	quietCandidate   string
-	refreshUntil     time.Duration
-	nextRefresh      time.Duration
-	refreshes        uint64
-	protocols        map[string]*protocolRuntime
-	reanchorPending  map[uint64]bool
+	cfg               Config
+	candidates        []*candidate
+	senders           map[uint64]*senderRuntime
+	senderList        []*senderRuntime
+	selected          *candidate
+	lastEnd           time.Duration
+	started           bool
+	lastDecision      Decision
+	recoveryUntil     time.Duration
+	deadlineDeficits  uint64
+	countDeficits     uint64
+	discontinuities   uint64
+	rng               uint64
+	quietActive       bool
+	auditActive       bool
+	quietCandidate    string
+	refreshUntil      time.Duration
+	nextRefresh       time.Duration
+	refreshes         uint64
+	protocols         map[string]*protocolRuntime
+	reanchorPending   map[uint64]bool
+	watchdogDirty     bool
+	nextWatchdogCheck time.Duration
 
 	// forceFullQualificationRefresh is used only by differential tests to run
 	// the pre-optimization control path on every block.
@@ -284,6 +292,7 @@ func New(cfg Config) (*Scheduler, error) {
 		senderList:      make([]*senderRuntime, 0, len(cfg.Senders)),
 		protocols:       make(map[string]*protocolRuntime),
 		reanchorPending: make(map[uint64]bool),
+		watchdogDirty:   true,
 		rng:             cfg.RandomSeed,
 	}
 	if s.rng == 0 {
@@ -308,9 +317,10 @@ func New(cfg Config) (*Scheduler, error) {
 			return nil, err
 		}
 		c := &candidate{
-			cfg:        candidateCfg,
-			senders:    make(map[uint64]*senderModel, len(cfg.Senders)),
-			senderList: make([]*senderModel, 0, len(cfg.Senders)),
+			cfg:              candidateCfg,
+			senders:          make(map[uint64]*senderModel, len(cfg.Senders)),
+			senderList:       make([]*senderModel, 0, len(cfg.Senders)),
+			eligibilityDirty: true,
 		}
 		c.wakeScale = 1
 		c.epoch = 1
@@ -456,7 +466,9 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 		}
 	}
 
-	s.checkWatchdogs(end)
+	if s.watchdogDirty || (s.nextWatchdogCheck > 0 && end >= s.nextWatchdogCheck) {
+		s.checkWatchdogs(end)
+	}
 	if s.forceFullQualificationRefresh || qualificationChanged || s.qualificationDue(end) {
 		s.refreshQualifications(end)
 	}
@@ -530,6 +542,7 @@ func (s *Scheduler) resetLearning() {
 		c.promotionReady = 0
 		c.recoveryUntil = 0
 		c.wakeScale = 1
+		c.invalidateSchedule()
 	}
 	for _, sender := range s.senderList {
 		sender.protocol = ""
@@ -544,7 +557,10 @@ func (s *Scheduler) resetLearning() {
 		sender.watchdogLearned = false
 		sender.obligationDue = 0
 		sender.obligationOpen = false
+		sender.countStart = 0
 	}
+	s.watchdogDirty = true
+	s.nextWatchdogCheck = 0
 	s.refreshUntil = 0
 	s.nextRefresh = 0
 }
@@ -624,6 +640,10 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 		if first > 0 {
 			copy(runtimeSender.observations, runtimeSender.observations[first:])
 			runtimeSender.observations = runtimeSender.observations[:len(runtimeSender.observations)-first]
+			runtimeSender.countStart -= first
+			if runtimeSender.countStart < 0 {
+				runtimeSender.countStart = 0
+			}
 		}
 	}
 	if overdue := s.effectiveOverdue(runtimeSender); overdue > 0 {
@@ -644,6 +664,7 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 		model := c.senders[id]
 		if reanchor {
 			model.reanchor(protocol, at)
+			c.invalidateSchedule()
 			continue
 		}
 		if c.lastEligible {
@@ -655,10 +676,12 @@ func (s *Scheduler) observe(id uint64, protocol string, at time.Duration, forced
 		if model.observe(protocol, at, c.cfg, c.wakeScale) {
 			c.beginNewEpoch(at, true)
 		}
+		c.invalidateSchedule()
 	}
 	if reanchor {
 		delete(s.reanchorPending, id)
 	}
+	s.watchdogDirty = true
 
 	if s.cfg.Mode == ModeGated && s.selected != nil && (forcedEscape || (s.selected.lastEligible && !s.selected.lastAwake)) {
 		s.recoverAtLeast(s.selected.steadySleep(), at)
@@ -799,6 +822,7 @@ func (c *candidate) beginNewEpoch(now time.Duration, widen bool) {
 		}
 	}
 	c.recoveryUntil = now
+	c.invalidateSchedule()
 }
 
 func (c *candidate) tightenAfterRefresh(now time.Duration) {
@@ -828,31 +852,80 @@ func scaleDuration(value time.Duration, scale float64) time.Duration {
 }
 
 func (c *candidate) allLearned() bool {
+	if !c.eligibilityDirty {
+		return c.eligibleCached
+	}
+	c.eligibleCached = true
 	for _, sender := range c.senderList {
 		if !sender.learned {
-			return false
+			c.eligibleCached = false
+			break
 		}
 	}
-	return true
+	c.eligibilityDirty = false
+	return c.eligibleCached
 }
 
 func (c *candidate) awakeDuring(start, end time.Duration) bool {
-	for _, sender := range c.senderList {
-		if sender.awakeDuring(start, end) {
+	startFloat := float64(start)
+	endFloat := float64(end)
+	if c.wakeCacheValid {
+		if c.wakeUntil > startFloat {
 			return true
 		}
+		if c.wakeUntil == 0 && c.nextWakeStart >= endFloat {
+			return false
+		}
 	}
-	return false
+
+	awake := false
+	wakeUntil := 0.0
+	nextWakeStart := math.Inf(1)
+	for _, sender := range c.senderList {
+		senderAwake, senderWakeUntil, senderNextWake := sender.awakeWindow(start, end)
+		if senderAwake {
+			awake = true
+			if senderWakeUntil > wakeUntil {
+				wakeUntil = senderWakeUntil
+			}
+		} else if senderNextWake < nextWakeStart {
+			nextWakeStart = senderNextWake
+		}
+	}
+	c.wakeCacheValid = true
+	c.wakeUntil = wakeUntil
+	c.nextWakeStart = nextWakeStart
+	return awake
 }
 
 func (m *senderModel) awakeDuring(start, end time.Duration) bool {
+	awake, _, _ := m.awakeWindow(start, end)
+	return awake
+}
+
+func (m *senderModel) awakeWindow(start, end time.Duration) (awake bool, wakeUntil, nextWakeStart float64) {
 	if !m.learned || m.period <= 0 {
-		return true
+		return true, math.Inf(1), math.Inf(1)
 	}
 	period := float64(m.period)
 	first := math.Ceil(float64(start-m.postWake-m.anchor) / period)
 	center := float64(m.anchor) + first*period
-	return center-float64(m.preWake) < float64(end) && center+float64(m.postWake) > float64(start)
+	windowStart := center - float64(m.preWake)
+	windowEnd := center + float64(m.postWake)
+	if windowStart < float64(end) && windowEnd > float64(start) {
+		return true, windowEnd, math.Inf(1)
+	}
+	if windowEnd <= float64(start) {
+		windowStart += period
+	}
+	return false, 0, windowStart
+}
+
+func (c *candidate) invalidateSchedule() {
+	c.eligibilityDirty = true
+	c.wakeCacheValid = false
+	c.wakeUntil = 0
+	c.nextWakeStart = 0
 }
 
 func robustPeriod(history []time.Duration) (time.Duration, []time.Duration) {
@@ -982,6 +1055,16 @@ func (s *Scheduler) watchdogsReady() bool {
 
 func (s *Scheduler) checkWatchdogs(now time.Duration) {
 	failed := false
+	s.watchdogDirty = false
+	s.nextWatchdogCheck = 0
+	scheduleCheck := func(at time.Duration) {
+		if at <= now {
+			return
+		}
+		if s.nextWatchdogCheck == 0 || at < s.nextWatchdogCheck {
+			s.nextWatchdogCheck = at
+		}
+	}
 	for _, sender := range s.senderList {
 		overdue := s.effectiveOverdue(sender)
 		if sender.seen && sender.obligationOpen && overdue > 0 && now >= sender.obligationDue {
@@ -997,17 +1080,22 @@ func (s *Scheduler) checkWatchdogs(now time.Duration) {
 				}
 				failed = true
 			}
+		} else if sender.seen && sender.obligationOpen && overdue > 0 {
+			scheduleCheck(sender.obligationDue)
 		}
 		window := s.effectiveCountWindow(sender)
 		minimum := s.effectiveMinimumCount(sender)
-		if sender.seen && minimum > 0 && window > 0 && now >= window {
+		if sender.seen && minimum > 0 && window > 0 && now < window {
+			scheduleCheck(window)
+		} else if sender.seen && minimum > 0 && window > 0 {
 			lower := now - window
-			count := 0
-			for _, observed := range sender.observations {
-				if observed >= lower && observed <= now {
-					count++
-				}
+			if sender.countStart > len(sender.observations) {
+				sender.countStart = len(sender.observations)
 			}
+			for sender.countStart < len(sender.observations) && sender.observations[sender.countStart] < lower {
+				sender.countStart++
+			}
+			count := len(sender.observations) - sender.countStart
 			deficit := count < minimum
 			if deficit && !sender.countOpen {
 				s.countDeficits++
@@ -1019,6 +1107,13 @@ func (s *Scheduler) checkWatchdogs(now time.Duration) {
 				failed = true
 			} else if !deficit {
 				sender.countOpen = false
+				// The count first becomes deficient immediately after the
+				// observation that currently leaves exactly minimum samples
+				// in the inclusive rolling window.
+				expires := sender.observations[len(sender.observations)-minimum]
+				if expires <= time.Duration(1<<63-1)-window-1 {
+					scheduleCheck(expires + window + 1)
+				}
 			}
 		}
 	}

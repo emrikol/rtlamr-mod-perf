@@ -380,6 +380,132 @@ unlock:
 	return result;
 }
 
+static long rtlamr_exchange_slot(struct rtlamr_usb_ring *ring,
+				 unsigned long argument)
+{
+	struct rtlamr_usb_ring_exchange exchange;
+	struct rtlamr_usb_slot *release_slot = NULL;
+	struct rtlamr_usb_slot *claim_slot;
+	unsigned long flags;
+	bool release_committed = false;
+	u64 submit_sequence;
+	int result = 0;
+
+	if (copy_from_user(&exchange, (void __user *)argument,
+			   sizeof(exchange)))
+		return -EFAULT;
+	if (exchange.release_valid > 1 || exchange.reserved ||
+	    (exchange.release_valid && exchange.release.reserved) ||
+	    (exchange.release_valid &&
+	     exchange.release.slot >= ring->slot_count))
+		return -EINVAL;
+	if (mutex_lock_interruptible(&ring->io_mutex))
+		return -ERESTARTSYS;
+
+	/*
+	 * Return capacity to the USB queue before waiting. The old prototype did
+	 * this in the opposite order, permanently reduced active depth by one, and
+	 * could wait for a completion that the held slot was needed to produce.
+	 */
+	if (exchange.release_valid) {
+		spin_lock_irqsave(&ring->lock, flags);
+		release_slot = &ring->slots[exchange.release.slot];
+		if (exchange.release.sequence != ring->next_release ||
+		    release_slot->sequence != exchange.release.sequence ||
+		    release_slot->state != RTLAMR_SLOT_CLAIMED) {
+			result = -EINVAL;
+			spin_unlock_irqrestore(&ring->lock, flags);
+			goto out;
+		}
+		ring->next_release++;
+		atomic64_inc(&ring->releases);
+		if (ring->stopping || ring->disconnected || ring->fatal_error) {
+			release_slot->state = RTLAMR_SLOT_FREE;
+			result = ring->disconnected ? -ENODEV :
+				 ring->fatal_error ? ring->fatal_error : -ECANCELED;
+			spin_unlock_irqrestore(&ring->lock, flags);
+			goto out;
+		}
+		submit_sequence = ring->next_submit++;
+		release_slot->sequence = submit_sequence;
+		release_slot->length = 0;
+		release_slot->status = 0;
+		release_slot->state = RTLAMR_SLOT_INFLIGHT;
+		spin_unlock_irqrestore(&ring->lock, flags);
+
+		result = rtlamr_submit_slot(ring, release_slot);
+		if (result) {
+			spin_lock_irqsave(&ring->lock, flags);
+			release_slot->state = RTLAMR_SLOT_FREE;
+			ring->fatal_error = result;
+			spin_unlock_irqrestore(&ring->lock, flags);
+			wake_up_interruptible(&ring->wait);
+			goto out;
+		}
+		release_committed = true;
+	}
+
+	for (;;) {
+		u32 index = ring->next_claim % ring->slot_count;
+
+		if (release_committed) {
+			wait_event(ring->wait,
+				READ_ONCE(ring->disconnected) ||
+				READ_ONCE(ring->stopping) ||
+				READ_ONCE(ring->fatal_error) ||
+				READ_ONCE(ring->slots[index].state) ==
+					RTLAMR_SLOT_READY);
+			result = 0;
+		} else {
+			result = wait_event_interruptible(ring->wait,
+				READ_ONCE(ring->disconnected) ||
+				READ_ONCE(ring->stopping) ||
+				READ_ONCE(ring->fatal_error) ||
+				READ_ONCE(ring->slots[index].state) ==
+					RTLAMR_SLOT_READY);
+			if (result)
+				goto out;
+		}
+
+		spin_lock_irqsave(&ring->lock, flags);
+		if (ring->disconnected) {
+			result = -ENODEV;
+		} else if (ring->stopping) {
+			result = -ECANCELED;
+		} else {
+			claim_slot = &ring->slots[index];
+			if (ring->fatal_error &&
+			    claim_slot->state != RTLAMR_SLOT_READY) {
+				result = ring->fatal_error;
+				spin_unlock_irqrestore(&ring->lock, flags);
+				break;
+			}
+			if (claim_slot->state != RTLAMR_SLOT_READY ||
+			    claim_slot->sequence != ring->next_claim) {
+				spin_unlock_irqrestore(&ring->lock, flags);
+				continue;
+			}
+			exchange.completion.sequence = claim_slot->sequence;
+			exchange.completion.slot = index;
+			exchange.completion.length = claim_slot->length;
+			exchange.completion.status = claim_slot->status;
+			exchange.completion.reserved = 0;
+			claim_slot->state = RTLAMR_SLOT_CLAIMED;
+			ring->next_claim++;
+			result = 0;
+		}
+		spin_unlock_irqrestore(&ring->lock, flags);
+		break;
+	}
+
+	if (!result && copy_to_user((void __user *)argument, &exchange,
+				    sizeof(exchange)))
+		result = -EFAULT;
+out:
+	mutex_unlock(&ring->io_mutex);
+	return result;
+}
+
 static long rtlamr_ioctl(struct file *file, unsigned int command,
 			 unsigned long argument)
 {
@@ -410,6 +536,8 @@ static long rtlamr_ioctl(struct file *file, unsigned int command,
 		stats.short_transfers = atomic64_read(&ring->short_transfers);
 		return copy_to_user((void __user *)argument, &stats,
 				    sizeof(stats)) ? -EFAULT : 0;
+	case RTLAMR_USB_RING_IOC_EXCHANGE:
+		return rtlamr_exchange_slot(ring, argument);
 	default:
 		return -ENOTTY;
 	}

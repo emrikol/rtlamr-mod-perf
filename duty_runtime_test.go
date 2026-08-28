@@ -668,6 +668,29 @@ func BenchmarkDutyRuntimeShadowBlockAndCollar(b *testing.B) {
 	}
 }
 
+func BenchmarkDutyDecoderWakePreparation(b *testing.B) {
+	receiver := &Receiver{protocolNames: []string{"idm", "r900"}}
+	decoder, err := receiver.newProtocolDecoder()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("reset", func(b *testing.B) {
+		b.ReportAllocs()
+		for idx := 0; idx < b.N; idx++ {
+			decoder.Reset()
+		}
+	})
+	b.Run("reconstruct", func(b *testing.B) {
+		b.ReportAllocs()
+		for idx := 0; idx < b.N; idx++ {
+			decoder, err = receiver.newProtocolDecoder()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func TestDutyRestoreExternalCheckpoint(t *testing.T) {
 	source := os.Getenv("RTLAMR_DUTY_CHECKPOINT_DIR")
 	if source == "" {

@@ -17,6 +17,85 @@ func (m decoderTestMessage) MeterID() uint32  { return m.id }
 func (m decoderTestMessage) MeterType() uint8 { return 0 }
 func (m decoderTestMessage) Checksum() []byte { return nil }
 
+func TestDecoderResetMatchesFreshAllocatedState(t *testing.T) {
+	tests := []struct {
+		name     string
+		platform *power16Platform
+	}{
+		{name: "float"},
+		{name: "power16", platform: func() *power16Platform {
+			platform := power16DecoderTestPlatform()
+			return &platform
+		}()},
+		{name: "power16-packed", platform: func() *power16Platform {
+			platform := power16DecoderTestPlatform()
+			platform.runPacked = func(decisions, packed []byte, window []uint16, input []byte) bool {
+				if !power16ReferenceBlock(decisions, window, input) {
+					return false
+				}
+				s6PackOracle(packed, decisions)
+				return true
+			}
+			return &platform
+		}()},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			makeDecoder := func() Decoder {
+				var decoder Decoder
+				if test.platform == nil {
+					decoder = newDecoder(power16PolicyDisabled, nil)
+				} else {
+					platform := *test.platform
+					decoder = newDecoder(power16PolicyAutomatic, func() power16Platform { return platform })
+				}
+				decoder.RegisterProtocol(newPower16DecoderTestParser(72, true, 72*4))
+				decoder.Allocate()
+				return decoder
+			}
+
+			dirty := makeDecoder()
+			fresh := makeDecoder()
+			random := rand.New(rand.NewSource(0x7265736574))
+			input := make([]byte, dirty.Cfg.BlockSize2)
+			for block := 0; block < 37; block++ {
+				if _, err := random.Read(input); err != nil {
+					t.Fatal(err)
+				}
+				dirty.Decode(input)
+			}
+			dirty.Reset()
+
+			for block := 0; block < 53; block++ {
+				if _, err := random.Read(input); err != nil {
+					t.Fatal(err)
+				}
+				gotMessages := dirty.Decode(input)
+				wantMessages := fresh.Decode(input)
+				if !reflect.DeepEqual(gotMessages, wantMessages) ||
+					!bytes.Equal(dirty.filterOutput, fresh.filterOutput) ||
+					!bytes.Equal(dirty.packed, fresh.packed) ||
+					dirty.quantizedStart != fresh.quantizedStart ||
+					!reflect.DeepEqual(dirty.DispatchStatus(), fresh.DispatchStatus()) {
+					t.Fatalf("block %d: reset decoder differs from fresh decoder", block)
+				}
+				for idx := range dirty.Quantized {
+					if dirty.quantizedAt(idx) != fresh.quantizedAt(idx) {
+						t.Fatalf("block %d decision %d differs", block, idx)
+					}
+				}
+				if !reflect.DeepEqual(dirty.Signal, fresh.Signal) {
+					t.Fatalf("block %d float signal differs", block)
+				}
+				if dirty.power16 != nil && !reflect.DeepEqual(dirty.power16.backing, fresh.power16.backing) {
+					t.Fatalf("block %d power history differs", block)
+				}
+			}
+		})
+	}
+}
+
 type decoderTestParser struct {
 	id   uint32
 	emit bool

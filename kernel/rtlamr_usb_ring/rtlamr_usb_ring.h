@@ -5,7 +5,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define RTLAMR_USB_RING_ABI 1U
+#define RTLAMR_USB_RING_ABI 2U
 #define RTLAMR_USB_RING_DEVICE "/dev/rtlamr_usb_ring0"
 
 struct rtlamr_usb_ring_info {
@@ -29,6 +29,19 @@ struct rtlamr_usb_ring_release {
 	__u32 reserved;
 };
 
+/*
+ * Return one consumed slot before waiting for and claiming the next completed
+ * slot. release_valid is zero for the initial claim. Once a release has been
+ * committed, the kernel wait is ended only by a completion or ring shutdown,
+ * so an interrupted caller can never lose ownership state between operations.
+ */
+struct rtlamr_usb_ring_exchange {
+	__u32 release_valid;
+	__u32 reserved;
+	struct rtlamr_usb_ring_release release;
+	struct rtlamr_usb_ring_completion completion;
+};
+
 struct rtlamr_usb_ring_stats {
 	__u64 completions;
 	__u64 releases;
@@ -48,5 +61,7 @@ struct rtlamr_usb_ring_stats {
 	_IO(RTLAMR_USB_RING_IOC_MAGIC, 0x03)
 #define RTLAMR_USB_RING_IOC_STATS \
 	_IOR(RTLAMR_USB_RING_IOC_MAGIC, 0x04, struct rtlamr_usb_ring_stats)
+#define RTLAMR_USB_RING_IOC_EXCHANGE \
+	_IOWR(RTLAMR_USB_RING_IOC_MAGIC, 0x05, struct rtlamr_usb_ring_exchange)
 
 #endif

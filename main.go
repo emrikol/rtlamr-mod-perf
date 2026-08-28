@@ -501,8 +501,9 @@ func (rcvr *Receiver) processBlock(state *receiverRunState, block []byte) bool {
 				return false
 			}
 		}
-		rcvr.duty.finishBlock(block, start, end, time.Now(), decision)
-		if err := rcvr.duty.maybeCheckpoint(time.Now()); err != nil {
+		wallNow := time.Now()
+		rcvr.duty.finishBlock(block, start, end, wallNow, decision)
+		if err := rcvr.duty.maybeCheckpoint(wallNow); err != nil {
 			slog.Error("write DSP duty scheduler checkpoint", "error", err)
 		}
 	}
@@ -632,19 +633,7 @@ func (rcvr *Receiver) rebuildDutyDecoder(state *receiverRunState) (bool, bool) {
 		}
 	}
 
-	oldCfg := rcvr.d.Cfg
-	fresh, err := rcvr.newProtocolDecoder()
-	if err != nil {
-		rcvr.err = fmt.Errorf("dutyscheduler: rebuild decoder: %w", err)
-		return false, false
-	}
-	if fresh.Cfg.BlockSize != oldCfg.BlockSize || fresh.Cfg.BlockSize2 != oldCfg.BlockSize2 || fresh.Cfg.BufferLength != oldCfg.BufferLength {
-		rcvr.err = errors.New("dutyscheduler: decoder geometry changed during wake")
-		return false, false
-	}
-	fresh.Cfg.CenterFreq = oldCfg.CenterFreq
-	fresh.Cfg.SampleRate = oldCfg.SampleRate
-	rcvr.d = fresh
+	rcvr.d.Reset()
 
 	clearDigestMap(state.prev)
 	clearDigestMap(state.next)

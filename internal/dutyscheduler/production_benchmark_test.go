@@ -6,6 +6,14 @@ import (
 )
 
 func BenchmarkProductionCandidateBankEstimatingBlock(b *testing.B) {
+	benchmarkProductionCandidateBankEstimatingBlock(b, false)
+}
+
+func BenchmarkProductionCandidateBankEstimatingBlockFullEvaluation(b *testing.B) {
+	benchmarkProductionCandidateBankEstimatingBlock(b, true)
+}
+
+func benchmarkProductionCandidateBankEstimatingBlock(b *testing.B, fullEvaluation bool) {
 	scheduler, err := New(DefaultConfig(ModeShadow, []uint64{1, 2, 3}))
 	if err != nil {
 		b.Fatal(err)
@@ -29,6 +37,15 @@ func BenchmarkProductionCandidateBankEstimatingBlock(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for idx := 0; idx < b.N; idx++ {
+		if fullEvaluation {
+			for _, candidate := range scheduler.candidates {
+				candidate.invalidateSchedule()
+			}
+			for _, sender := range scheduler.senderList {
+				sender.countStart = 0
+			}
+			scheduler.watchdogDirty = true
+		}
 		start := time.Duration(idx) * block
 		scheduler.Advance(start, start+block)
 	}
