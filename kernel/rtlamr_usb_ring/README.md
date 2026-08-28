@@ -10,6 +10,10 @@ The module is deliberately a streaming transport, not a tuner driver. The
 vendored librtlsdr configures the demodulator and tuner, releases interface
 zero, and asks Linux to bind this driver for bulk-IN streaming. On shutdown it
 reclaims the interface so librtlsdr can deinitialize the hardware normally.
+Before each ring START, the driver re-selects the interface's current alternate
+setting and then submits the initial URBs. This is required to establish a
+fresh endpoint context after the usbfs-to-kernel ownership handoff; successful
+URB submission alone does not prove that the endpoint is advancing.
 
 ## Build
 
@@ -54,6 +58,9 @@ the service account.
   16-byte release descriptor.
 - Slots are released in sequence and cannot be submitted again while the
   decoder or recovery collar may still reference their bytes.
+- Cancellation sends STOP before waiting for the blocked reader. STOP wakes
+  descriptor reads and cancels anchored URBs, so normal shutdown does not rely
+  on a watchdog or forced process termination.
 
 The cacheable mapping is intentional. Coherent USB allocations avoid explicit
 cache maintenance but can make sustained CPU reads substantially slower on

@@ -166,7 +166,9 @@ Linux users may additionally build the optional
 `-directkernelring`. It maps kernel-owned USB payload pages directly into the
 decoder and fails open to the ordinary direct source when the optional path is
 unavailable. The module must match the running kernel; see its README for build
-and device-permission details.
+and device-permission details. Ring cancellation and repeated usbfs/kernel
+handoffs are deterministic: shutdown stops blocked ring reads, and each START
+re-establishes the SDR interface before submitting URBs.
 
 ## Message Types
 

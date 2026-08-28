@@ -113,6 +113,19 @@ ordinary direct-SDR path. See
 [`kernel/rtlamr_usb_ring`](kernel/rtlamr_usb_ring) for the generic build and
 ownership contract.
 
+Ring lifecycle transitions are part of the performance contract because a
+successfully submitted but non-advancing ring can look artificially cheap.
+Cancellation sends the module's STOP ioctl before the receiver waits for its
+blocked reader. On every START, the driver re-selects the current USB interface
+and alternate setting before submitting the first URBs; this establishes a
+fresh endpoint context after ownership moves from usbfs to the kernel. A
+bounded hardware regression reproduced the old state as zero completions with
+zero reported submit/transfer errors. The corrected path produced and released
+buffers immediately across repeated normal restarts, with all error counters
+remaining zero. The direct cancellation regression also verifies that a
+kernel-backed read is actively interrupted instead of relying on process
+termination or a watchdog.
+
 ### Offline ring candidate bank
 
 `offline_ring_bank_test.go` provides opt-in corpus harnesses for screening
