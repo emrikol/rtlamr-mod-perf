@@ -890,7 +890,7 @@ func (d Decoder) Slice(indices []int) (pkts []Data) {
 	return d.slice(indices, true)
 }
 
-func (d Decoder) slice(indices []int, includeBits bool) (pkts []Data) {
+func (d *Decoder) slice(indices []int, includeBits bool) (pkts []Data) {
 	// For each of the indices the preamble exists at.
 	for _, qIdx := range indices {
 		// Check that we're still within the first sample block. We'll catch
