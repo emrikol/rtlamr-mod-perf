@@ -129,7 +129,7 @@ static void rtlamr_complete(struct urb *urb)
 		atomic64_inc(&ring->completions);
 	}
 	spin_unlock_irqrestore(&ring->lock, flags);
-	wake_up_interruptible(&ring->wait);
+	wake_up_all(&ring->wait);
 }
 
 static int rtlamr_submit_slot(struct rtlamr_usb_ring *ring,
@@ -198,7 +198,7 @@ static int rtlamr_ring_start(struct rtlamr_usb_ring *ring)
 		ring->stopping = true;
 		spin_unlock_irqrestore(&ring->lock, flags);
 		usb_kill_anchored_urbs(&ring->submitted);
-		wake_up_interruptible(&ring->wait);
+		wake_up_all(&ring->wait);
 	}
 	mutex_unlock(&ring->io_mutex);
 	return result;
@@ -221,13 +221,13 @@ static void rtlamr_ring_stop(struct rtlamr_usb_ring *ring)
 	}
 	ring->stopping = true;
 	spin_unlock_irqrestore(&ring->lock, flags);
-	wake_up_interruptible(&ring->wait);
+	wake_up_all(&ring->wait);
 	usb_kill_anchored_urbs(&ring->submitted);
 
 	spin_lock_irqsave(&ring->lock, flags);
 	ring->started = false;
 	spin_unlock_irqrestore(&ring->lock, flags);
-	wake_up_interruptible(&ring->wait);
+	wake_up_all(&ring->wait);
 }
 
 static int rtlamr_open(struct inode *inode, struct file *file)
@@ -369,7 +369,7 @@ static long rtlamr_release_slot(struct rtlamr_usb_ring *ring,
 		slot->state = RTLAMR_SLOT_FREE;
 		ring->fatal_error = result;
 		spin_unlock_irqrestore(&ring->lock, flags);
-		wake_up_interruptible(&ring->wait);
+		wake_up_all(&ring->wait);
 	}
 	mutex_unlock(&ring->io_mutex);
 	return result;
@@ -439,7 +439,7 @@ static long rtlamr_exchange_slot(struct rtlamr_usb_ring *ring,
 			release_slot->state = RTLAMR_SLOT_FREE;
 			ring->fatal_error = result;
 			spin_unlock_irqrestore(&ring->lock, flags);
-			wake_up_interruptible(&ring->wait);
+			wake_up_all(&ring->wait);
 			goto out;
 		}
 		release_committed = true;
@@ -449,6 +449,10 @@ static long rtlamr_exchange_slot(struct rtlamr_usb_ring *ring,
 		u32 index = ring->next_claim % ring->slot_count;
 
 		if (release_committed) {
+			/* Every producer and STOP path uses wake_up_all(): this
+			 * post-commit wait is deliberately uninterruptible so a
+			 * signal cannot make slot ownership ambiguous.
+			 */
 			wait_event(ring->wait,
 				READ_ONCE(ring->disconnected) ||
 				READ_ONCE(ring->stopping) ||
@@ -700,7 +704,7 @@ static void rtlamr_disconnect(struct usb_interface *interface)
 	ring->disconnected = true;
 	ring->stopping = true;
 	spin_unlock_irqrestore(&ring->lock, flags);
-	wake_up_interruptible(&ring->wait);
+	wake_up_all(&ring->wait);
 	usb_kill_anchored_urbs(&ring->submitted);
 	misc_deregister(&ring->misc);
 	kref_put(&ring->refs, rtlamr_ring_free);
