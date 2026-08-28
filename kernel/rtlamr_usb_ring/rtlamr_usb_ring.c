@@ -2,12 +2,14 @@
 /*
  * Persistent, mmap-backed bulk-IN ring for RTLAMR's direct RTL-SDR source.
  *
- * Payload pages use the ordinary USB-core DMA mapping path so that CPU reads
- * remain cacheable after completion.  The steady path allocates nothing and
- * never copies payload bytes across the kernel/userspace boundary.
+ * Payload pages remain DMA-mapped for the lifetime of the ring. Explicit DMA
+ * ownership synchronization keeps CPU reads cacheable without remapping every
+ * completed USB batch. The steady path allocates nothing and never copies
+ * payload bytes across the kernel/userspace boundary.
  */
 
 #include <linux/atomic.h>
+#include <linux/dma-mapping.h>
 #include <linux/fs.h>
 #include <linux/kref.h>
 #include <linux/mm.h>
@@ -50,6 +52,9 @@ struct rtlamr_usb_slot {
 	struct rtlamr_usb_ring *ring;
 	struct urb *urb;
 	void *data;
+	dma_addr_t dma;
+	bool dma_mapped;
+	bool cpu_synced;
 	u64 sequence;
 	u32 length;
 	int status;
@@ -58,6 +63,7 @@ struct rtlamr_usb_slot {
 
 struct rtlamr_usb_ring {
 	struct usb_device *udev;
+	struct device *dma_dev;
 	struct usb_interface *interface;
 	struct miscdevice misc;
 	struct usb_anchor submitted;
@@ -94,6 +100,9 @@ static void rtlamr_ring_free(struct kref *ref)
 
 	for (index = 0; index < ring->slot_count; index++) {
 		usb_free_urb(ring->slots[index].urb);
+		if (ring->slots[index].dma_mapped)
+			dma_unmap_single(ring->dma_dev, ring->slots[index].dma,
+					 ring->slot_bytes, DMA_FROM_DEVICE);
 		if (ring->slots[index].data)
 			free_pages_exact(ring->slots[index].data, ring->slot_bytes);
 	}
@@ -137,6 +146,11 @@ static int rtlamr_submit_slot(struct rtlamr_usb_ring *ring,
 {
 	int result;
 
+	if (slot->cpu_synced) {
+		dma_sync_single_for_device(ring->dma_dev, slot->dma,
+					   ring->slot_bytes, DMA_FROM_DEVICE);
+		slot->cpu_synced = false;
+	}
 	usb_anchor_urb(slot->urb, &ring->submitted);
 	result = usb_submit_urb(slot->urb, GFP_KERNEL);
 	if (result) {
@@ -316,6 +330,11 @@ static ssize_t rtlamr_read(struct file *file, char __user *buffer, size_t length
 		}
 		spin_unlock_irqrestore(&ring->lock, flags);
 		break;
+	}
+	if (!result) {
+		dma_sync_single_for_cpu(ring->dma_dev, slot->dma,
+					ring->slot_bytes, DMA_FROM_DEVICE);
+		slot->cpu_synced = true;
 	}
 	if (!result && copy_to_user(buffer, &completion, sizeof(completion)))
 		result = -EFAULT;
@@ -502,9 +521,14 @@ static long rtlamr_exchange_slot(struct rtlamr_usb_ring *ring,
 		break;
 	}
 
-	if (!result && copy_to_user((void __user *)argument, &exchange,
-				    sizeof(exchange)))
-		result = -EFAULT;
+	if (!result) {
+		dma_sync_single_for_cpu(ring->dma_dev, claim_slot->dma,
+					ring->slot_bytes, DMA_FROM_DEVICE);
+		claim_slot->cpu_synced = true;
+		if (copy_to_user((void __user *)argument, &exchange,
+				 sizeof(exchange)))
+			result = -EFAULT;
+	}
 out:
 	mutex_unlock(&ring->io_mutex);
 	return result;
@@ -636,6 +660,7 @@ static int rtlamr_probe(struct usb_interface *interface,
 		return -ENOMEM;
 	}
 	ring->udev = usb_get_dev(interface_to_usbdev(interface));
+	ring->dma_dev = ring->udev->bus->sysdev;
 	ring->interface = interface;
 	ring->endpoint = endpoint->bEndpointAddress;
 	ring->slot_count = ring_slots;
@@ -644,6 +669,10 @@ static int rtlamr_probe(struct usb_interface *interface,
 	spin_lock_init(&ring->lock);
 	mutex_init(&ring->io_mutex);
 	kref_init(&ring->refs);
+	if (!ring->dma_dev) {
+		result = -ENODEV;
+		goto fail;
+	}
 	atomic_set(&ring->opened, 0);
 	init_usb_anchor(&ring->submitted);
 	atomic64_set(&ring->completions, 0);
@@ -662,6 +691,13 @@ static int rtlamr_probe(struct usb_interface *interface,
 			result = -ENOMEM;
 			goto fail;
 		}
+		slot->dma = dma_map_single(ring->dma_dev, slot->data,
+					   ring->slot_bytes, DMA_FROM_DEVICE);
+		if (dma_mapping_error(ring->dma_dev, slot->dma)) {
+			result = -EIO;
+			goto fail;
+		}
+		slot->dma_mapped = true;
 		slot->urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!slot->urb) {
 			result = -ENOMEM;
@@ -672,6 +708,8 @@ static int rtlamr_probe(struct usb_interface *interface,
 					ring->endpoint & USB_ENDPOINT_NUMBER_MASK),
 				  slot->data, ring->slot_bytes, rtlamr_complete,
 				  slot);
+		slot->urb->transfer_dma = slot->dma;
+		slot->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 	}
 
 	ring->misc.minor = MISC_DYNAMIC_MINOR;

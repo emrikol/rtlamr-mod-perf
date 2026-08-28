@@ -237,16 +237,20 @@ func (rcvr *Receiver) NewReceiver() {
 			slog.Error("direct RTL-SDR source is unavailable in this build")
 			os.Exit(1)
 		}
+		batchBlocks := receiverReadBlocks
+		if *directKernelRing {
+			batchBlocks = *directKernelBatchBlocks
+		}
 		retainBatches := 0
 		if *directKernelRing && *dutySchedulerMode == "gated" {
-			retainBatches = (dutyCollarBlockCount(cfg) + receiverReadBlocks - 1) / receiverReadBlocks
+			retainBatches = (dutyCollarBlockCount(cfg) + batchBlocks - 1) / batchBlocks
 		}
 		directConfig := directRTLConfig{
 			Device:            *directDevice,
 			CenterFreq:        cfg.CenterFreq,
 			SampleRate:        uint32(cfg.SampleRate),
 			BlockBytes:        uint32(cfg.BlockSize2),
-			BatchBytes:        uint32(cfg.BlockSize2 * receiverReadBlocks),
+			BatchBytes:        uint32(cfg.BlockSize2 * batchBlocks),
 			TunerGainModeSet:  visited["tunergainmode"] || !gainFlagSet,
 			TunerGainMode:     rcvr.Flags.TunerGainMode || !gainFlagSet,
 			TunerGainSet:      visited["tunergain"],

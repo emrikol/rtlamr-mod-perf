@@ -42,9 +42,10 @@ var (
 )
 
 var (
-	inputSource      = flag.String("source", "tcp", "sample source: tcp or direct")
-	directDevice     = flag.String("device", "0", "RTL-SDR device index or serial for the direct source")
-	directKernelRing = flag.Bool("directkernelring", false, "use the optional Linux kernel-owned direct-SDR ring")
+	inputSource             = flag.String("source", "tcp", "sample source: tcp or direct")
+	directDevice            = flag.String("device", "0", "RTL-SDR device index or serial for the direct source")
+	directKernelRing        = flag.Bool("directkernelring", false, "use the optional Linux kernel-owned direct-SDR ring")
+	directKernelBatchBlocks = flag.Int("directkernelbatchblocks", receiverReadBlocks, "decoder blocks per kernel-ring USB batch")
 )
 
 var msgType StringMap
@@ -111,6 +112,7 @@ func RegisterFlags() {
 		"source":                     true,
 		"device":                     true,
 		"directkernelring":           true,
+		"directkernelbatchblocks":    true,
 	}
 
 	printDefaults := func(validFlags map[string]bool, inclusion bool) {
@@ -192,6 +194,12 @@ func HandleFlags() {
 	if *directKernelRing && strings.ToLower(*inputSource) != "direct" {
 		log.Fatal("directkernelring requires source=direct")
 	}
+	if err := validateDirectKernelBatchBlocks(*directKernelBatchBlocks); err != nil {
+		log.Fatal(err)
+	}
+	if *directKernelBatchBlocks != receiverReadBlocks && !*directKernelRing {
+		log.Fatal("directkernelbatchblocks requires directkernelring")
+	}
 	switch *dutySchedulerMode {
 	case "off":
 		if *dutySchedulerReport != "" || *dutySchedulerCheckpointDir != "" || *dutySchedulerPolicy != "" {
@@ -210,6 +218,13 @@ func HandleFlags() {
 	default:
 		log.Fatal("invalid dutyscheduler mode")
 	}
+}
+
+func validateDirectKernelBatchBlocks(blocks int) error {
+	if blocks < 1 || blocks > 256 {
+		return fmt.Errorf("directkernelbatchblocks must be between 1 and 256")
+	}
+	return nil
 }
 
 func newOutputEncoder(outputFormat string, output io.Writer, sampleFilename string) (Encoder, error) {

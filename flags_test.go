@@ -28,3 +28,16 @@ func TestSortedProtocolNames(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateDirectKernelBatchBlocks(t *testing.T) {
+	for _, blocks := range []int{1, receiverReadBlocks, 36, 256} {
+		if err := validateDirectKernelBatchBlocks(blocks); err != nil {
+			t.Fatalf("validateDirectKernelBatchBlocks(%d): %v", blocks, err)
+		}
+	}
+	for _, blocks := range []int{-1, 0, 257} {
+		if err := validateDirectKernelBatchBlocks(blocks); err == nil {
+			t.Fatalf("validateDirectKernelBatchBlocks(%d) succeeded", blocks)
+		}
+	}
+}
