@@ -37,6 +37,12 @@ optional direct RTL-SDR input path when their runtime gates pass.
   **7.98% less rtlamr CPU** than the already optimized direct-input + gated-DSP
   baseline. TCP remains the default, and the optional module fails open to the
   ordinary direct path.
+- On the reference low-throughput direct-SDR pipeline, setting Go's standard
+  `GOMAXPROCS=1` reduced median decoder-process CPU by **37.0%** in an
+  eight-row counterbalanced screen. It cut scheduler wakeups and migrations
+  without changing the decoder, USB ingestion, or DSP algorithms. This is an
+  opt-in workload-specific tuning; multi-decoder or otherwise parallel
+  workloads should measure their own setting.
 - An opt-in self-learning DSP duty scheduler provides safe-seed, shadow,
   gated, audit, periodic full-refresh, and fail-open recovery behavior. It will
   not skip DSP until every configured sender independently clears the selected

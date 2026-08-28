@@ -72,6 +72,32 @@ fixed replay used during development, timed parser allocation fell from roughly
 `298 KiB / 7,173 allocations` to `384 B / 17 allocations` while preserving the
 decoded output.
 
+### Single-P Go runtime scheduling
+
+The reference deployment has one serial decoder hot path plus blocking USB and
+collector work. Its earlier whole-process profile attributed 29.66% of sampled
+cycles inclusively to Go runtime monitoring and preemption. Restricting the Go
+scheduler to one logical processor with the standard `GOMAXPROCS=1`
+environment setting leaves cgo/USB blocking concurrent while avoiding idle-P
+monitoring, wakeups, and migrations.
+
+An eight-row, counterbalanced live screen measured median decoder CPU at
+5.253982% of one core for the default setting and 3.308617% for
+`GOMAXPROCS=1`, a **37.03% reduction**. Candidate context switches ranged from
+7.8--9.2 thousand per 30-second row versus 19.7--33.8 thousand for control.
+A later fresh production profile measured 2.896404% of one core with all
+configured anonymized streams fresh, zero service restarts, zero ring errors,
+and no thermal throttling.
+
+In that zero-lost-sample profile, DSP was dominant again: the fused DSP leaf
+was 55.75% self cycles and aligned dual-family search was 3.61%. The largest
+remaining non-DSP inclusive stacks were `runtime.sysmon` at 13.42%, the
+kernel-ring release cgo/ioctl path at 7.23%, candidate parsing at 3.70%, and
+duty-scheduler advancement at 2.94%. Inclusive shares overlap and must not be
+summed. `GOMAXPROCS=1` is therefore documented as an opt-in operational tuning,
+not compiled as a universal default for workloads that may benefit from Go
+parallelism.
+
 ## Input pipeline
 
 ### Direct RTL-SDR source
@@ -178,6 +204,23 @@ synchronization bytes. The exact-collar 464 KiB geometry instead saved only
 These are structural replay results, not measured CPU gains. The subsequent
 hardware gate rejected the 576 KiB persistent-DMA/plan candidate on streaming
 liveness before counterbalanced CPU rows were retained.
+
+### Rejected non-DSP follow-ups
+
+An additive ABI-compatible ring exchange candidate fused descriptor release and
+the next blocking claim into one ioctl, with automatic fallback to the legacy
+ABI. A direct IDM candidate-parser path separately avoided packet
+materialization and improved fixed replay by 0.659% with identical messages.
+The combined candidate reduced live CPU, but most of that gain came from the
+independently proven single-P runtime setting. Its frozen candidate-only live
+gate observed only two of three anonymized sender classes before the fixed
+deadline. Both code candidates were therefore reverted and are not included in
+the retained release.
+
+A duty-scheduler binary-search/clock-hoisting candidate improved fixed replay
+by only 0.22%, inside the control spread, and was also reverted. These terminal
+results keep the current release focused on changes whose complete-boundary
+benefit and live semantics both cleared their predeclared gates.
 
 ## Modeled energy implications
 
