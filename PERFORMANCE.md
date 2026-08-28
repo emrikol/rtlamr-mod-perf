@@ -47,6 +47,15 @@ decoder-boundary checkpoint was **8.93%** faster than the corresponding Go
 control. Unsupported geometry, CPU identity, self-test failure, or the kill
 switch selects the Go implementation.
 
+The immutable process-wide quantizer descriptor is returned by pointer after
+its one-time probe. Returning that multi-field descriptor by value for every
+R900 symbol had caused Go to emit a hot `runtime.duffcopy`. Removing the copy
+reduced selected-quantizer dispatch time by **18.10%** (130.65 to 107.0 ns) and
+improved a counterbalanced 1,440-block combined R900/IDM replay by **0.93%** at
+the complete decoder boundary. Both variants produced the same message count;
+the change does not weaken the CPU gate, startup self-test, kill switches, or
+dispatch counters.
+
 ### Parser and allocation cleanup
 
 Packet extraction now walks owned rings and candidate indices directly. R900
