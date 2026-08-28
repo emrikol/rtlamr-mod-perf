@@ -29,19 +29,6 @@ struct rtlamr_usb_ring_release {
 	__u32 reserved;
 };
 
-/*
- * Atomically return the previously consumed slot and claim the next completed
- * slot.  This additive ioctl keeps ABI-1 read/release clients compatible while
- * allowing new clients to remove one syscall and one io_mutex acquisition per
- * ring turn.
- */
-struct rtlamr_usb_ring_exchange {
-	__u32 release_valid;
-	__u32 reserved;
-	struct rtlamr_usb_ring_release release;
-	struct rtlamr_usb_ring_completion completion;
-};
-
 struct rtlamr_usb_ring_stats {
 	__u64 completions;
 	__u64 releases;
@@ -61,7 +48,5 @@ struct rtlamr_usb_ring_stats {
 	_IO(RTLAMR_USB_RING_IOC_MAGIC, 0x03)
 #define RTLAMR_USB_RING_IOC_STATS \
 	_IOR(RTLAMR_USB_RING_IOC_MAGIC, 0x04, struct rtlamr_usb_ring_stats)
-#define RTLAMR_USB_RING_IOC_EXCHANGE \
-	_IOWR(RTLAMR_USB_RING_IOC_MAGIC, 0x05, struct rtlamr_usb_ring_exchange)
 
 #endif
