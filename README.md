@@ -17,8 +17,11 @@ optional direct RTL-SDR input path when their runtime gates pass.
   fixed-L72 R900 SIMD leaf added another **8.93%** at its complete boundary.
   Returning the immutable R900 dispatch descriptor by reference subsequently
   removed a hot Go structure copy, cutting dispatch overhead **18.10%** and
-  improving the fixed combined-protocol replay **0.93%**. These stage results
-  are sequential checkpoints and must not be added together.
+  improving the fixed combined-protocol replay **0.93%**. Pointer receivers for
+  parser dispatch, packet slicing, and IDM parsing subsequently removed the
+  remaining large receiver copies, with sequential fixed-replay gains of
+  **1.43%**, **0.36%**, and **0.68%**. These stage results are sequential
+  checkpoints and must not be added together.
 - Pure-Go packet extraction and parser work removed nearly all timed parser
   allocation (`298,512 B / 7,173 allocs` to `384 B / 17 allocs` over the
   fixed replay), while direct RTL-SDR input removes the separate `rtl_tcp`

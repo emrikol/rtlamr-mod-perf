@@ -56,6 +56,14 @@ the complete decoder boundary. Both variants produced the same message count;
 the change does not weaken the CPU gate, startup self-test, kill switches, or
 dispatch counters.
 
+Three later Go-only receiver cleanups changed large hot value receivers to
+pointers without changing ownership: decoder parser dispatch improved the same
+fixed replay by **1.43%**, packet slicing by **0.36%**, and IDM parsing by
+**0.68%**, each relative to its immediate control. These are sequential stages,
+not additive claims. In the matching live profiles, residual
+`runtime.duffcopy` fell from 1.56% to 0.33% of cycles while message output was
+preserved.
+
 ### Parser and allocation cleanup
 
 Packet extraction now walks owned rings and candidate indices directly. R900
