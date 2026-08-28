@@ -3,6 +3,7 @@ package dutyscheduler
 import (
 	"math"
 	"math/rand"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -658,6 +659,104 @@ func TestShadowStatePromotesToGatedWithFailOpenRecovery(t *testing.T) {
 	if !decision.Decode || decision.State != "RECOVERY" {
 		t.Fatalf("promoted scheduler suppressed DSP during recovery: %+v", decision)
 	}
+}
+
+func exerciseQualificationDeferral(t *testing.T, operations []byte) {
+	t.Helper()
+	if len(operations) > 4096 {
+		operations = operations[:4096]
+	}
+	fast, err := New(testConfig(ModeGated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := New(testConfig(ModeGated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	full.forceFullQualificationRefresh = true
+
+	now := time.Duration(0)
+	ids := [...]uint64{1, 2, 3}
+	for step, operation := range operations {
+		duration := time.Duration(operation>>2+1) * 250 * time.Millisecond
+		start := now
+		if operation&0x3f == 2 {
+			start += duration
+		}
+		end := start + duration
+		fastDecision := fast.Advance(start, end)
+		fullDecision := full.Advance(start, end)
+		if fastDecision != fullDecision {
+			t.Fatalf("decision differs at step %d: fast=%+v full=%+v", step, fastDecision, fullDecision)
+		}
+		now = end
+
+		if operation&3 == 0 {
+			id := ids[int(operation>>4)%len(ids)]
+			protocol := "R900"
+			if id == 1 {
+				protocol = "IDM"
+			}
+			fast.Observe(id, protocol, now)
+			full.Observe(id, protocol, now)
+		}
+		if operation&0x7f == 1 {
+			id := ids[(int(operation>>2)+1)%len(ids)]
+			protocol := "R900"
+			if id == 1 {
+				protocol = "IDM"
+			}
+			fast.ObserveEscape(id, protocol, now)
+			full.ObserveEscape(id, protocol, now)
+		}
+		if operation == 0xff {
+			fast.PrepareResume()
+			full.PrepareResume()
+		}
+		if step%32 == 31 {
+			assertEquivalentSchedulers(t, fast, full, step)
+		}
+	}
+	assertEquivalentSchedulers(t, fast, full, len(operations))
+}
+
+func assertEquivalentSchedulers(t *testing.T, fast, full *Scheduler, step int) {
+	t.Helper()
+	fastState, err := fast.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullState, err := full.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fastState, fullState) {
+		t.Fatalf("exported state differs at step %d", step)
+	}
+	if fast.selectedName() != full.selectedName() || fast.lastDecision != full.lastDecision || fast.quietActive != full.quietActive || fast.auditActive != full.auditActive || fast.quietCandidate != full.quietCandidate || !reflect.DeepEqual(fast.reanchorPending, full.reanchorPending) {
+		t.Fatalf("runtime state differs at step %d", step)
+	}
+}
+
+func TestQualificationDeferralMatchesFullRefresh(t *testing.T) {
+	for seed := int64(1); seed <= 32; seed++ {
+		random := rand.New(rand.NewSource(seed))
+		operations := make([]byte, 1024)
+		if _, err := random.Read(operations); err != nil {
+			t.Fatal(err)
+		}
+		exerciseQualificationDeferral(t, operations)
+	}
+}
+
+func FuzzQualificationDeferralMatchesFullRefresh(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0, 1, 2, 3, 0xff})
+	f.Add([]byte{0xfc, 0xfc, 0xfc, 0xfc, 0x01, 0x02})
+	f.Fuzz(func(t *testing.T, operations []byte) {
+		exerciseQualificationDeferral(t, operations)
+	})
 }
 
 func BenchmarkShadowCandidateBankBlock(b *testing.B) {

@@ -242,6 +242,10 @@ type Scheduler struct {
 	refreshes        uint64
 	protocols        map[string]*protocolRuntime
 	reanchorPending  map[uint64]bool
+
+	// forceFullQualificationRefresh is used only by differential tests to run
+	// the pre-optimization control path on every block.
+	forceFullQualificationRefresh bool
 }
 
 func New(cfg Config) (*Scheduler, error) {
@@ -431,12 +435,16 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 		s.nextRefresh = 0
 	}
 
+	qualificationChanged := false
 	for _, c := range s.candidates {
 		c.lastEligible = c.allLearned()
 		c.lastAwake = true
 		duration := end - start
 		if c.lastEligible {
 			c.lastAwake = c.awakeDuring(start, end)
+			if c.eligibleDuration == 0 {
+				qualificationChanged = true
+			}
 			c.eligibleDuration += duration
 			if c.lastAwake {
 				c.awakeDuration += duration
@@ -449,7 +457,9 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 	}
 
 	s.checkWatchdogs(end)
-	s.refreshQualifications(end)
+	if s.forceFullQualificationRefresh || qualificationChanged || s.qualificationDue(end) {
+		s.refreshQualifications(end)
+	}
 	s.chooseCandidate()
 
 	decision := Decision{Decode: true, State: s.state(), Selected: s.selectedName()}
@@ -489,6 +499,19 @@ func (s *Scheduler) Advance(start, end time.Duration) Decision {
 	}
 	s.lastDecision = decision
 	return decision
+}
+
+// qualificationDue reports whether wall-clock progress alone can change a
+// candidate's qualification. All other qualification inputs change through
+// Observe, which refreshes immediately, or when the first eligible duration is
+// accumulated above.
+func (s *Scheduler) qualificationDue(now time.Duration) bool {
+	for _, c := range s.candidates {
+		if (c.invalid && now >= c.recoveryUntil) || (!c.qualified && c.promotionReady > 0 && now >= c.promotionReady) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scheduler) resetLearning() {
